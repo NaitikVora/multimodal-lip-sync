@@ -16,6 +16,7 @@ gpu_image = (
     .apt_install("ffmpeg", "libsndfile1")
     .pip_install(
         "numpy<2",
+        "huggingface_hub<0.24",
         "torch==2.1.2",
         "torchaudio==2.1.2",
         "pyannote.audio>=3.1.0,<3.4",
@@ -52,14 +53,10 @@ class SpeakerSeparationPipeline:
     def load_models(self):
         import os
 
-        import huggingface_hub
         import torch
         from pyannote.audio import Pipeline as PyannotePipeline
         from speechbrain.inference.separation import SepformerSeparation
         from speechbrain.inference.speaker import EncoderClassifier
-
-        # Login so all HF downloads are authenticated (pyannote needs gated model access)
-        huggingface_hub.login(token=os.environ["HF_TOKEN"])
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
@@ -67,6 +64,7 @@ class SpeakerSeparationPipeline:
         print("Loading pyannote diarization pipeline...")
         self.diarizer = PyannotePipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1",
+            use_auth_token=os.environ["HF_TOKEN"],
         )
         self.diarizer.to(self.device)
 
@@ -85,36 +83,73 @@ class SpeakerSeparationPipeline:
         print("All models loaded successfully!")
 
     @modal.method()
-    def process_session(self, audio_bytes: bytes, session_name: str) -> dict:
-        """Process a single session's audio.
+    def process_session(
+        self,
+        channel_a_bytes: bytes,
+        channel_b_bytes: bytes,
+        mixed_bytes: bytes,
+        session_name: str,
+    ) -> dict:
+        """Run Pipeline B (channel-aware) only.
 
-        Args:
-            audio_bytes: Raw WAV file bytes (mixed/mono/stereo).
-            session_name: Human-readable session identifier.
-
-        Returns:
-            {"original": bytes, "doctor": bytes, "patient": bytes}
+        Returns: {"speaker_a": bytes, "speaker_b": bytes, "metadata": dict}
         """
         from src.pipeline import run_pipeline
 
         return run_pipeline(
-            audio_bytes=audio_bytes,
+            channel_a_bytes=channel_a_bytes,
+            channel_b_bytes=channel_b_bytes,
+            mixed_bytes=mixed_bytes,
             session_name=session_name,
             diarizer=self.diarizer,
             embedder=self.embedder,
             separator=self.separator,
-            denoise_enabled=True,
-            denoise_prop=0.6,
-            num_speakers=2,
-            num_enrollment=5,
-            min_enrollment_duration=1.0,
-            fade_ms=15,
-            peak_db=-1.0,
         )
 
     @modal.method()
+    def process_session_compare(
+        self,
+        channel_a_bytes: bytes,
+        channel_b_bytes: bytes,
+        mixed_bytes: bytes,
+        session_name: str,
+    ) -> dict:
+        """Run both Pipeline B and C in a single GPU call.
+
+        Returns: {
+            "channel": {"speaker_a": bytes, "speaker_b": bytes, "metadata": dict},
+            "sepformer": {"speaker_a": bytes, "speaker_b": bytes, "metadata": dict},
+        }
+        """
+        from src.pipeline import run_pipeline, run_pipeline_sepformer
+
+        channel_results = run_pipeline(
+            channel_a_bytes=channel_a_bytes,
+            channel_b_bytes=channel_b_bytes,
+            mixed_bytes=mixed_bytes,
+            session_name=session_name,
+            diarizer=self.diarizer,
+            embedder=self.embedder,
+            separator=self.separator,
+        )
+
+        sepformer_results = run_pipeline_sepformer(
+            channel_a_bytes=channel_a_bytes,
+            channel_b_bytes=channel_b_bytes,
+            mixed_bytes=mixed_bytes,
+            session_name=session_name,
+            diarizer=self.diarizer,
+            embedder=self.embedder,
+            separator=self.separator,
+        )
+
+        return {
+            "channel": channel_results,
+            "sepformer": sepformer_results,
+        }
+
+    @modal.method()
     def health_check(self) -> str:
-        """Quick check that models are loaded and GPU is available."""
         import torch
 
         gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A"
@@ -127,13 +162,12 @@ class SpeakerSeparationPipeline:
 
 
 # ---------------------------------------------------------------------------
-# Volume-based transfer for large files (Option B fallback)
+# Volume helpers
 # ---------------------------------------------------------------------------
 
 
 @app.function(image=gpu_image, volumes={"/data": audio_volume}, timeout=60)
 def upload_to_volume(data: bytes, remote_path: str) -> str:
-    """Write bytes to the shared Modal Volume."""
     from pathlib import Path
 
     path = Path(f"/data/{remote_path}")
@@ -145,83 +179,7 @@ def upload_to_volume(data: bytes, remote_path: str) -> str:
 
 @app.function(image=gpu_image, volumes={"/data": audio_volume}, timeout=60)
 def download_from_volume(remote_path: str) -> bytes:
-    """Read bytes from the shared Modal Volume."""
     from pathlib import Path
 
     path = Path(f"/data/{remote_path}")
     return path.read_bytes()
-
-
-# ---------------------------------------------------------------------------
-# Volume-based processing for large files
-# ---------------------------------------------------------------------------
-
-
-@app.cls(
-    image=gpu_image,
-    gpu="A10G",
-    timeout=1800,
-    volumes={"/data": audio_volume},
-    secrets=[hf_secret],
-    scaledown_window=300,
-)
-class SpeakerSeparationPipelineVolume:
-    """Same as SpeakerSeparationPipeline but reads/writes via Volume."""
-
-    @modal.enter()
-    def load_models(self):
-        import os
-
-        import huggingface_hub
-        import torch
-        from pyannote.audio import Pipeline as PyannotePipeline
-        from speechbrain.inference.separation import SepformerSeparation
-        from speechbrain.inference.speaker import EncoderClassifier
-
-        huggingface_hub.login(token=os.environ["HF_TOKEN"])
-
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        self.diarizer = PyannotePipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.1",
-        )
-        self.diarizer.to(self.device)
-
-        self.embedder = EncoderClassifier.from_hparams(
-            source="speechbrain/spkrec-ecapa-voxceleb",
-            run_opts={"device": str(self.device)},
-        )
-
-        self.separator = SepformerSeparation.from_hparams(
-            source="speechbrain/sepformer-whamr16k",
-            run_opts={"device": str(self.device)},
-        )
-
-    @modal.method()
-    def process_session_volume(
-        self, input_path: str, output_prefix: str, session_name: str
-    ) -> dict:
-        """Process from Volume path, write results back, return output paths."""
-        from pathlib import Path
-
-        from src.pipeline import run_pipeline
-
-        audio_bytes = Path(f"/data/{input_path}").read_bytes()
-
-        results = run_pipeline(
-            audio_bytes=audio_bytes,
-            session_name=session_name,
-            diarizer=self.diarizer,
-            embedder=self.embedder,
-            separator=self.separator,
-        )
-
-        output_paths = {}
-        for key, wav_bytes in results.items():
-            out_path = f"{output_prefix}_{key}.wav"
-            Path(f"/data/{out_path}").parent.mkdir(parents=True, exist_ok=True)
-            Path(f"/data/{out_path}").write_bytes(wav_bytes)
-            output_paths[key] = out_path
-
-        audio_volume.commit()
-        return output_paths

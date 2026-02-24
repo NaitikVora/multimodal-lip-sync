@@ -1,90 +1,118 @@
 # Speaker Separation Tool
 
-A Python-based speaker separation tool for clinical audio recordings. Takes messy doctor–patient conversations (heavy cross-talk from closely-spaced microphones) and produces clean, speaker-separated output files.
+A Python-based speaker separation tool for clinical audio recordings. Takes messy doctor-patient conversations (heavy cross-talk from closely-spaced microphones) and produces clean, speaker-separated output files.
 
-All GPU computation runs on **Modal** (serverless GPU cloud). Your local Mac handles only CLI orchestration and file I/O.
+All GPU computation runs on **Modal** (serverless GPU cloud). A local **web app** (FastAPI + React) provides the user interface for uploading audio, triggering processing, and listening to results.
 
 ---
 
 ## Quick Start
 
-```bash
-# 1. Install local dependencies
-pip install -r requirements.txt
-
-# 2. Authenticate with Modal (one-time)
-modal setup
-
-# 3. Create a HuggingFace secret for pyannote model access
-#    First, accept model terms at: https://huggingface.co/pyannote/speaker-diarization-3.1
-#    Then create a token at: https://huggingface.co/settings/tokens
-modal secret create huggingface-token HF_TOKEN=hf_xxxxxxxxx
-
-# 4. Deploy the Modal app (builds container image — first run takes ~5-10 min)
-modal deploy modal_app.py
-
-# 5. Process all sessions
-python main.py --input-dir ./Audio_Files --output-dir ./output
-
-# Process a single session
-python main.py --input-dir ./Audio_Files --output-dir ./output --session 3
-
-# Dry run (check files only)
-python main.py --input-dir ./Audio_Files --output-dir ./output --dry-run
-
-# Health check (verify models are loaded)
-python main.py --input-dir ./Audio_Files --health-check
-```
-
----
-
-## Prerequisites
+### 1. Prerequisites
 
 | Requirement | Details |
 |---|---|
 | **Python** | 3.10+ |
+| **Node.js** | 18+ (for frontend build) |
 | **Modal account** | [modal.com](https://modal.com) — $30 free credit on signup |
 | **HuggingFace account** | [huggingface.co](https://huggingface.co) — free |
 | **HF Token** | Create at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) |
 | **pyannote model access** | Accept terms at [huggingface.co/pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1) and [huggingface.co/pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0) |
+
+### 2. Setup
+
+```bash
+# Install Python dependencies
+pip install -r requirements.txt
+
+# Authenticate with Modal (one-time)
+modal setup
+
+# Add your HuggingFace token to Modal
+modal secret create huggingface-token HF_TOKEN=hf_xxxxxxxxx
+
+# Deploy the GPU pipeline (first run takes ~5-10 min to build image)
+modal deploy modal_app.py
+
+# Install and build the frontend
+cd frontend && npm install && npm run build && cd ..
+```
+
+### 3. Run the Web App
+
+```bash
+python server.py
+```
+
+Open **http://localhost:8000** in your browser. The app discovers sessions from `Audio_Files/`, lets you process them, and plays back the separated audio directly.
+
+### 4. Development Mode (hot reload)
+
+```bash
+# Terminal 1 — backend (auto-reloads on changes)
+python server.py
+
+# Terminal 2 — frontend dev server (hot module replacement)
+cd frontend && npm run dev
+```
+
+Then open **http://localhost:5173** (Vite proxies `/api` to the FastAPI backend).
+
+### 5. CLI (alternative)
+
+The original command-line interface still works:
+
+```bash
+python main.py --input-dir ./Audio_Files --output-dir ./output
+python main.py --input-dir ./Audio_Files --output-dir ./output --session 3
+python main.py --input-dir ./Audio_Files --output-dir ./output --dry-run
+```
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│  LOCAL MAC                                           │
-│                                                      │
-│  main.py (CLI entry point)                           │
-│    ├── Reads WAV files from Audio_Files/             │
-│    ├── Mixes multi-mic input to mono                 │
-│    ├── Sends audio bytes to Modal GPU function       │
-│    ├── Receives separated WAV bytes back             │
-│    └── Saves output/ directory locally               │
-└──────────────────────┬──────────────────────────────┘
+┌───────────────────────────────────────────────────────┐
+│  BROWSER (React + Tailwind)                            │
+│                                                        │
+│  ┌──────────┐ ┌──────────────┐ ┌───────────────────┐  │
+│  │ Upload   │ │ Session List │ │ Audio Players +   │  │
+│  │ Zone     │ │ + Process    │ │ Download          │  │
+│  └──────────┘ └──────────────┘ └───────────────────┘  │
+└──────────────────────┬────────────────────────────────┘
+                       │ REST + SSE
+                       ▼
+┌───────────────────────────────────────────────────────┐
+│  LOCAL (FastAPI — server.py)                           │
+│                                                        │
+│  /api/sessions    — discover Audio_Files/               │
+│  /api/upload      — receive new WAV files              │
+│  /api/process/:id — trigger Modal, stream progress     │
+│  /api/results/:id — serve output WAV files             │
+└──────────────────────┬────────────────────────────────┘
                        │ modal.Cls.method.remote()
                        ▼
-┌─────────────────────────────────────────────────────┐
-│  MODAL CLOUD (A10G GPU, 24 GB VRAM)                  │
-│                                                      │
-│  SpeakerSeparationPipeline                           │
-│    ├── @enter: Load all models once                  │
-│    │   ├── pyannote diarization 3.1                  │
-│    │   ├── ECAPA-TDNN speaker embeddings             │
-│    │   └── SepFormer (whamr16k)                      │
-│    │                                                  │
-│    └── @method process_session()                     │
-│        ├── Stage 0: Load, downmix, resample 16 kHz  │
-│        ├── Stage 1: Denoise (noisereduce)            │
-│        ├── Stage 2: Diarize (num_speakers=2)         │
-│        ├── Stage 3: Extract speaker embeddings       │
-│        ├── Stage 4: Hybrid separation                │
-│        │   ├── Non-overlap → gate original audio     │
-│        │   └── Overlap → SepFormer + emb. matching   │
-│        ├── Stage 5: Stitch & normalize               │
-│        └── Stage 6: Assign doctor vs patient         │
-└─────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────┐
+│  MODAL CLOUD (A10G GPU, 24 GB VRAM)                    │
+│                                                        │
+│  SpeakerSeparationPipeline                             │
+│    ├── @enter: Load all models once                    │
+│    │   ├── pyannote diarization 3.1                    │
+│    │   ├── ECAPA-TDNN speaker embeddings               │
+│    │   └── SepFormer (whamr16k)                        │
+│    │                                                    │
+│    └── @method process_session()                       │
+│        ├── Stage 0: Load, downmix, resample 16 kHz    │
+│        ├── Stage 1: Denoise (noisereduce)              │
+│        ├── Stage 2: Diarize (num_speakers=2)           │
+│        ├── Stage 3: Extract speaker embeddings         │
+│        ├── Stage 4: Hybrid separation                  │
+│        │   ├── Non-overlap → gate original audio       │
+│        │   └── Overlap → SepFormer + emb. matching     │
+│        ├── Stage 5: Stitch & normalize                 │
+│        └── Stage 6: Assign doctor vs patient           │
+└───────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -152,8 +180,9 @@ Both tracks are padded to the same length as the original. Silence when a speake
 | `speechbrain` ECAPA-TDNN | Speaker embeddings | Robust 192-dim embeddings; resolves SepFormer permutation ambiguity |
 | `noisereduce` | Denoising | Pure Python; no complex dependencies; effective on stationary noise |
 | `Modal` | Serverless GPU | On-demand A10G; no CUDA setup on Mac; ~$1.10/hr |
-| `click` | CLI | Clean argument parsing with help text |
-| `rich` | Terminal UI | Progress bars, tables, colored output |
+| `FastAPI` | Backend API | Async, modern, SSE support for real-time progress |
+| `React` + `Vite` | Frontend | Fast dev experience, type-safe with TypeScript |
+| `Tailwind CSS` | Styling | Utility-first, minimal bundle, clean aesthetic |
 
 ---
 
@@ -175,6 +204,10 @@ The `wsj02mix` model was trained on clean, artificially mixed speech. Our clinic
 
 SepFormer's output order is arbitrary — "source 1" and "source 2" don't correspond to consistent speakers across chunks. By comparing each separated source's embedding to the speaker centroids from Stage 3, we assign sources to the correct speakers.
 
+### Why SSE for progress updates
+
+Server-Sent Events are simpler than WebSockets for one-directional updates (server to client). No extra dependencies needed — FastAPI's `StreamingResponse` handles it natively.
+
 ---
 
 ## Output Structure
@@ -195,19 +228,43 @@ All outputs: 16 kHz, mono, 16-bit PCM WAV.
 
 ---
 
-## File Transfer
+## Project Structure
 
-Two strategies are implemented with automatic selection:
-
-- **Direct byte passing** (default): Audio bytes are sent as function arguments and results returned directly. Simple and fast for files under 50 MB.
-- **Volume-based transfer** (automatic fallback): For files exceeding 50 MB, audio is uploaded to a Modal Volume, processed, and results downloaded. This avoids Modal's function argument size limits.
+```
+├── README.md                    # This file
+├── requirements.txt             # Python dependencies (local)
+├── config.py                    # All configurable parameters
+├── server.py                    # FastAPI backend (web app entry point)
+├── main.py                      # CLI entry point (alternative)
+├── modal_app.py                 # Modal App, Image, GPU Cls definitions
+├── src/
+│   ├── __init__.py
+│   ├── audio_utils.py           # Local audio I/O utilities
+│   └── pipeline.py              # Full separation pipeline (runs in Modal)
+├── frontend/
+│   ├── package.json
+│   ├── vite.config.ts           # Vite config with API proxy
+│   ├── index.html
+│   └── src/
+│       ├── main.tsx
+│       ├── App.tsx              # Main layout
+│       ├── api.ts               # API client + SSE helpers
+│       └── components/
+│           ├── SessionCard.tsx   # Session display + processing controls
+│           ├── UploadZone.tsx    # Drag-and-drop file upload
+│           └── AudioPlayer.tsx   # Playback + download
+├── output/                      # Generated output files
+├── Audio_Files/                 # Input session directories
+└── tests/
+    └── test_pipeline.py         # Unit + integration tests
+```
 
 ---
 
 ## Challenges & Honest Assessment
 
 - **Cross-talk from close mics is fundamentally hard.** Both speakers appear at similar levels on both channels. This limits what spatial/beamforming methods can achieve — we rely on learned separation instead.
-- **Real-world audio ≠ synthetic benchmarks.** SepFormer achieves impressive SI-SNRi on WSJ0-2mix, but clinical recordings with room tone, compression artifacts, and variable mic placement are harder.
+- **Real-world audio is not synthetic benchmarks.** SepFormer achieves impressive SI-SNRi on WSJ0-2mix, but clinical recordings with room tone, compression artifacts, and variable mic placement are harder.
 - **Overlap separation won't be studio-clean.** Expect artifacts in overlapping regions. Non-overlapping segments (the majority) will sound great since they're gated from the original.
 - **Doctor/patient labeling is heuristic.** The first-speaker and speaking-time rules work for typical clinical encounters but aren't guaranteed.
 - **Diarization can miss short utterances.** Brief backchannels ("mm-hmm", "okay") during the other speaker's turn may be misattributed.
@@ -220,9 +277,8 @@ Two strategies are implemented with automatic selection:
 2. **pyannote PixIT pipeline** — Joint diarization + separation in a single model, potentially better overlap handling
 3. **ClearerVoice-Studio MossFormer2** — Newer separation architecture that may outperform SepFormer on this domain
 4. **Confidence scores per segment** — Flag low-confidence separations for human review
-5. **Web UI** — Upload audio and preview results in the browser
-6. **Streaming processing** — Process long recordings in chunks to reduce memory usage and enable progress tracking
-7. **Speaker verification** — Use enrollment audio of the actual doctor for more reliable role assignment
+5. **Streaming processing** — Process long recordings in chunks to reduce memory usage and enable progress tracking
+6. **Speaker verification** — Use enrollment audio of the actual doctor for more reliable role assignment
 
 ---
 
@@ -235,29 +291,6 @@ Two strategies are implemented with automatic selection:
 | **Total** | | | **< $1.00** |
 
 The container stays warm for 5 minutes between sessions, so sequential processing avoids repeated cold starts.
-
----
-
-## Project Structure
-
-```
-├── README.md                # This file
-├── requirements.txt         # Local dependencies (Mac)
-├── config.py                # All configurable parameters
-├── main.py                  # Local CLI entry point
-├── modal_app.py             # Modal App, Image, GPU Cls definitions
-├── src/
-│   ├── __init__.py
-│   ├── audio_utils.py       # Local audio I/O utilities
-│   └── pipeline.py          # Full separation pipeline (runs in Modal container)
-├── output/                  # Generated output files
-├── Audio_Files/             # Input session directories
-│   ├── Session_001/
-│   ├── Session_002/
-│   └── ...
-└── tests/
-    └── test_pipeline.py     # Unit + integration tests
-```
 
 ---
 
@@ -274,3 +307,5 @@ The container stays warm for 5 minutes between sessions, so sequential processin
 **Timeout on long recordings** — The default timeout is 30 minutes. For recordings longer than ~45 minutes, increase `MODAL_TIMEOUT` in `config.py` and redeploy.
 
 **Output labels are swapped** — The doctor/patient assignment is heuristic. Simply rename the files if they're wrong for your recording.
+
+**Frontend won't load** — Make sure you ran `cd frontend && npm install && npm run build` first, or use dev mode with `npm run dev`.

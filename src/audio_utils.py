@@ -32,7 +32,6 @@ def find_session_folder(input_dir: Path, session_num: int) -> Optional[Path]:
         if path.is_dir():
             return path
 
-    # Regex fallback: any folder whose name contains the session number
     for child in sorted(input_dir.iterdir()):
         if not child.is_dir():
             continue
@@ -55,18 +54,63 @@ def discover_sessions(input_dir: Path) -> list[int]:
     return sorted(set(sessions))
 
 
-def load_session_audio(session_dir: Path) -> tuple[bytes, dict]:
-    """Load all WAV files in a session folder into a single mixed mono signal.
+def _read_wav_mono_16k(wav_path: Path) -> np.ndarray:
+    """Read a WAV file, downmix to mono, resample to 16 kHz, normalize."""
+    data, sr = sf.read(wav_path, dtype="float32")
+
+    if data.ndim > 1:
+        data = np.mean(data, axis=1)
+
+    if sr != 16000:
+        import librosa
+        data = librosa.resample(data, orig_sr=sr, target_sr=16000)
+
+    peak = np.max(np.abs(data))
+    if peak > 0:
+        data = data / peak
+
+    return data
+
+
+def _encode_wav_bytes(audio: np.ndarray, sr: int = 16000) -> bytes:
+    """Encode float32 audio array to 16-bit PCM WAV bytes."""
+    buf = io.BytesIO()
+    sf.write(buf, audio, sr, subtype="PCM_16", format="WAV")
+    return buf.getvalue()
+
+
+def _classify_mic(filename: str) -> str:
+    """Determine mic channel from filename. Returns 'a', 'b', or 'unknown'.
+
+    Supports naming conventions:
+    - doctor/doc/speaker_a/mic_a/mic1/ch1/channel_1 → channel A
+    - patient/pat/speaker_b/mic_b/mic2/ch2/channel_2 → channel B
+    """
+    lower = filename.lower()
+    # Channel A patterns (first mic / doctor / speaker A)
+    if any(p in lower for p in ["doctor", "doc", "speaker_a", "mic_a", "mic1", "mic_1", "ch1", "ch_1", "channel_1", "channel_a"]):
+        return "a"
+    # Channel B patterns (second mic / patient / speaker B)
+    if any(p in lower for p in ["patient", "pat", "speaker_b", "mic_b", "mic2", "mic_2", "ch2", "ch_2", "channel_2", "channel_b"]):
+        return "b"
+    return "unknown"
+
+
+def load_session_audio_separate(session_dir: Path) -> tuple[dict, dict]:
+    """Load session WAVs keeping channels separate, identified by mic role.
 
     Returns:
-        (wav_bytes, info_dict) where wav_bytes is 16kHz mono 16-bit PCM WAV
-        and info_dict has metadata about what was loaded.
+        (channels, info) where channels is:
+          {"channel_a_bytes": bytes, "channel_b_bytes": bytes, "mixed_bytes": bytes}
+        and info has file metadata.
+
+    If mic roles can't be identified from filenames, falls back to ordering
+    (first file = channel A, second = channel B).
     """
     wav_files = sorted(session_dir.glob("*.wav")) + sorted(session_dir.glob("*.WAV"))
     if not wav_files:
         raise FileNotFoundError(f"No WAV files found in {session_dir}")
 
-    # De-duplicate (case-insensitive filesystems)
     seen = set()
     unique_files = []
     for f in wav_files:
@@ -76,60 +120,70 @@ def load_session_audio(session_dir: Path) -> tuple[bytes, dict]:
             unique_files.append(f)
     wav_files = unique_files
 
-    arrays = []
+    # Classify files by mic channel
+    classified: dict[str, list[tuple[Path, np.ndarray]]] = {
+        "a": [], "b": [], "unknown": [],
+    }
     file_info = []
 
     for wav_path in wav_files:
-        data, sr = sf.read(wav_path, dtype="float32")
-
-        # Downmix to mono if multi-channel
-        if data.ndim > 1:
-            data = np.mean(data, axis=1)
-
-        # Resample to 16kHz if needed
-        if sr != 16000:
-            import librosa
-            data = librosa.resample(data, orig_sr=sr, target_sr=16000)
-            sr = 16000
-
-        arrays.append(data)
+        data = _read_wav_mono_16k(wav_path)
+        role = _classify_mic(wav_path.name)
+        classified[role].append((wav_path, data))
         file_info.append({
             "name": wav_path.name,
-            "original_sr": sr,
+            "role": role,
             "duration_s": len(data) / 16000,
             "size_bytes": wav_path.stat().st_size,
         })
 
-    # Mix all arrays to a single mono signal (pad shorter ones with silence)
-    max_len = max(len(a) for a in arrays)
-    mixed = np.zeros(max_len, dtype=np.float32)
-    for a in arrays:
-        padded = np.zeros(max_len, dtype=np.float32)
-        padded[: len(a)] = a
-        mixed += padded
+    # Resolve channels: prefer classified, fall back to positional
+    if classified["a"] and classified["b"]:
+        ch_a_audio = classified["a"][0][1]
+        ch_b_audio = classified["b"][0][1]
+    elif len(wav_files) >= 2:
+        arrays = [_read_wav_mono_16k(f) for f in wav_files[:2]]
+        ch_a_audio, ch_b_audio = arrays[0], arrays[1]
+    elif len(wav_files) == 1:
+        only = _read_wav_mono_16k(wav_files[0])
+        ch_a_audio = only
+        ch_b_audio = only
+    else:
+        raise FileNotFoundError(f"No WAV files found in {session_dir}")
 
-    # Average to avoid clipping from summation
-    if len(arrays) > 1:
-        mixed /= len(arrays)
+    # Pad to same length
+    max_len = max(len(ch_a_audio), len(ch_b_audio))
+    if len(ch_a_audio) < max_len:
+        ch_a_audio = np.pad(ch_a_audio, (0, max_len - len(ch_a_audio)))
+    if len(ch_b_audio) < max_len:
+        ch_b_audio = np.pad(ch_b_audio, (0, max_len - len(ch_b_audio)))
 
-    # Normalize to [-1, 1]
+    # Create mix for diarization
+    mixed = (ch_a_audio + ch_b_audio) / 2.0
     peak = np.max(np.abs(mixed))
     if peak > 0:
-        mixed /= peak
+        mixed = mixed / peak
 
-    # Encode as 16-bit PCM WAV bytes
-    buf = io.BytesIO()
-    sf.write(buf, mixed, 16000, subtype="PCM_16", format="WAV")
-    wav_bytes = buf.getvalue()
+    channels = {
+        "channel_a_bytes": _encode_wav_bytes(ch_a_audio),
+        "channel_b_bytes": _encode_wav_bytes(ch_b_audio),
+        "mixed_bytes": _encode_wav_bytes(mixed),
+    }
 
     info = {
         "files": file_info,
         "num_files": len(wav_files),
-        "mixed_duration_s": max_len / 16000,
+        "duration_s": max_len / 16000,
         "total_bytes": sum(f["size_bytes"] for f in file_info),
     }
 
-    return wav_bytes, info
+    return channels, info
+
+
+def load_session_audio(session_dir: Path) -> tuple[bytes, dict]:
+    """Legacy: load all WAVs into a single mixed mono signal."""
+    channels, info = load_session_audio_separate(session_dir)
+    return channels["mixed_bytes"], info
 
 
 def save_wav_bytes(wav_bytes: bytes, output_path: Path) -> None:

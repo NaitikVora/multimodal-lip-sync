@@ -90,7 +90,7 @@ class TestAudioUtils:
 
         assert isinstance(wav_bytes, bytes)
         assert info["num_files"] == 1
-        assert info["mixed_duration_s"] > 0
+        assert info["duration_s"] > 0
 
         # Verify it's valid WAV
         data, sr = sf.read(io.BytesIO(wav_bytes))
@@ -199,9 +199,45 @@ class TestPipelineStages:
         assert sr == 16000
         assert np.max(np.abs(data)) <= 1.0
 
-    def test_assign_roles_first_speaker(self):
+    def test_postprocess_segments_merge_same_speaker(self):
+        from src.pipeline import postprocess_segments
+
+        segments = [
+            {"speaker": "A", "start": 0.0, "end": 1.0},
+            {"speaker": "A", "start": 1.1, "end": 2.0},  # gap=0.1s, same speaker
+            {"speaker": "B", "start": 2.5, "end": 4.0},
+        ]
+        result = postprocess_segments(segments, max_gap_merge=0.3)
+        assert len(result) == 2
+        assert result[0]["speaker"] == "A"
+        assert result[0]["end"] == 2.0
+
+    def test_postprocess_segments_remove_islands(self):
+        from src.pipeline import postprocess_segments
+
+        segments = [
+            {"speaker": "A", "start": 0.0, "end": 2.0},
+            {"speaker": "B", "start": 2.0, "end": 2.1},  # 0.1s island
+            {"speaker": "A", "start": 2.1, "end": 4.0},
+        ]
+        result = postprocess_segments(segments, min_island_duration=0.15)
+        assert len(result) == 1
+        assert result[0]["speaker"] == "A"
+
+    def test_postprocess_segments_keep_real_turns(self):
+        from src.pipeline import postprocess_segments
+
+        segments = [
+            {"speaker": "A", "start": 0.0, "end": 2.0},
+            {"speaker": "B", "start": 2.0, "end": 5.0},
+            {"speaker": "A", "start": 5.0, "end": 8.0},
+        ]
+        result = postprocess_segments(segments)
+        assert len(result) == 3
+
+    def test_assign_speakers_first_speaker(self):
         torch = pytest.importorskip("torch")
-        from src.pipeline import assign_roles
+        from src.pipeline import assign_speakers
 
         segments = [
             {"speaker": "SPK_01", "start": 0.5, "end": 3.0},
@@ -212,9 +248,9 @@ class TestPipelineStages:
             "SPK_00": torch.randn(192),
             "SPK_01": torch.randn(192),
         }
-        doctor, patient = assign_roles({}, segments, embeddings)
-        assert doctor == "SPK_00"
-        assert patient == "SPK_01"
+        speaker_a, speaker_b = assign_speakers(segments, embeddings)
+        assert speaker_a == "SPK_00"
+        assert speaker_b == "SPK_01"
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +277,5 @@ class TestModalIntegration:
         wav_bytes = make_wav_bytes(duration_s=5.0)
         results = pipeline.process_session.remote(wav_bytes, "test_session")
 
-        assert "original" in results
-        assert "doctor" in results
-        assert "patient" in results
+        assert "speaker_a" in results
+        assert "speaker_b" in results

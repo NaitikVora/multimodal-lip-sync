@@ -100,13 +100,13 @@ def process_session_volume(pipeline_vol, audio_bytes: bytes, session_name: str) 
     help="Check that the Modal app is deployed and models are loaded.",
 )
 def main(input_dir: str, output_dir: str, session: int, dry_run: bool, health_check: bool):
-    """Speaker Separation Tool — processes clinical audio via Modal GPU cloud."""
+    """Speaker Separation Tool — processes audio via Modal GPU cloud."""
     input_path = Path(input_dir)
     output_path = Path(output_dir)
 
     console.print(Panel.fit(
         "[bold]Speaker Separation Tool[/]\n"
-        "Clinical audio → separated doctor & patient tracks\n"
+        "Audio → separated Speaker A & Speaker B tracks\n"
         f"Input:  {input_path.resolve()}\n"
         f"Output: {output_path.resolve()}",
         border_style="blue",
@@ -198,7 +198,7 @@ def main(input_dir: str, output_dir: str, session: int, dry_run: bool, health_ch
                 console.print(
                     f"\n[bold cyan]{session_name}[/]: "
                     f"{info['num_files']} files, "
-                    f"{info['mixed_duration_s']:.1f}s, "
+                    f"{info['duration_s']:.1f}s, "
                     f"{len(audio_bytes)/1024/1024:.1f} MB mixed"
                 )
 

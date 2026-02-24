@@ -2,9 +2,20 @@
 
 All imports in this file are container-side only (torch, pyannote, speechbrain, etc.).
 Functions are called by the Modal Cls defined in modal_app.py.
+
+Pipeline stages:
+  0. Load & preprocess (mono, 16 kHz, normalize)
+  1. Denoise (noisereduce with tuned parameters)
+  2. Diarize (pyannote 3.1, constrained to 2 speakers)
+  3. Post-process diarization segments (merge, clean, smooth)
+  4. Extract duration-weighted speaker embeddings (ECAPA-TDNN)
+  5. Assign speaker labels (first speaker + channel energy validation)
+  6. Separate audio (channel-aware or SepFormer for overlaps)
+  7. Post-process output tracks (normalize, encode)
 """
 
 import io
+import time
 
 import numpy as np
 import soundfile as sf
@@ -36,18 +47,36 @@ def load_and_preprocess(audio_bytes: bytes) -> tuple[np.ndarray, int]:
 
 
 # ---------------------------------------------------------------------------
-# Stage 1: Denoising
+# Stage 1: Denoising (improved parameters)
 # ---------------------------------------------------------------------------
 
 
 def denoise_audio(
-    audio: np.ndarray, sr: int, prop_decrease: float = 0.6
+    audio: np.ndarray,
+    sr: int,
+    prop_decrease: float = 0.6,
+    n_fft: int = 2048,
+    freq_mask_smooth_hz: int = 500,
+    time_mask_smooth_ms: int = 50,
 ) -> np.ndarray:
-    """Reduce stationary noise with noisereduce. Skippable via config."""
+    """Reduce stationary noise with noisereduce using tuned parameters.
+
+    Improvements over defaults:
+    - n_fft=2048 gives better frequency resolution for speech
+    - freq_mask_smooth_hz=500 prevents harsh spectral artifacts
+    - time_mask_smooth_ms=50 prevents choppy temporal gating
+    """
     try:
         import noisereduce as nr
 
-        return nr.reduce_noise(y=audio, sr=sr, prop_decrease=prop_decrease)
+        return nr.reduce_noise(
+            y=audio,
+            sr=sr,
+            prop_decrease=prop_decrease,
+            n_fft=n_fft,
+            freq_mask_smooth_hz=freq_mask_smooth_hz,
+            time_mask_smooth_ms=time_mask_smooth_ms,
+        )
     except Exception as e:
         print(f"[WARN] Denoising failed, using raw audio: {e}")
         return audio
@@ -61,11 +90,7 @@ def denoise_audio(
 def diarize(
     audio: np.ndarray, sr: int, diarizer, num_speakers: int = 2
 ) -> list[dict]:
-    """Run pyannote diarization, return list of segment dicts.
-
-    Each dict: {"speaker": str, "start": float, "end": float}
-    Also tags overlap regions.
-    """
+    """Run pyannote diarization, return list of segment dicts."""
     import torch
 
     waveform = torch.from_numpy(audio).unsqueeze(0).float()
@@ -90,12 +115,103 @@ def diarize(
     return segments
 
 
+# ---------------------------------------------------------------------------
+# Stage 3: Diarization Post-Processing (NEW — major accuracy improvement)
+# ---------------------------------------------------------------------------
+
+
+def postprocess_segments(
+    segments: list[dict],
+    min_segment_duration: float = 0.25,
+    max_gap_merge: float = 0.3,
+    min_island_duration: float = 0.15,
+) -> list[dict]:
+    """Clean up raw diarization output for more accurate speaker separation.
+
+    Four-pass algorithm:
+      1. Merge same-speaker segments separated by short gaps (< max_gap_merge)
+      2. Remove short "island" segments surrounded by another speaker
+      3. Absorb remaining short segments (< min_segment_duration) into neighbors
+      4. Final same-speaker merge pass to consolidate
+
+    This dramatically reduces fragmented segments that cause choppy output.
+    """
+    if len(segments) < 2:
+        return segments
+
+    segments = sorted(segments, key=lambda s: s["start"])
+
+    # Pass 1: Merge same-speaker segments with small gaps
+    merged = [segments[0].copy()]
+    for seg in segments[1:]:
+        prev = merged[-1]
+        gap = seg["start"] - prev["end"]
+        if seg["speaker"] == prev["speaker"] and gap <= max_gap_merge:
+            prev["end"] = max(prev["end"], seg["end"])
+        else:
+            merged.append(seg.copy())
+
+    # Pass 2: Remove short isolated "island" segments
+    # An island is a short segment of Speaker X surrounded by Speaker Y on both sides
+    if len(merged) >= 3:
+        cleaned = [merged[0]]
+        for i in range(1, len(merged) - 1):
+            seg = merged[i]
+            duration = seg["end"] - seg["start"]
+            prev_spk = cleaned[-1]["speaker"]
+            next_spk = merged[i + 1]["speaker"]
+
+            if (
+                duration < min_island_duration
+                and prev_spk == next_spk
+                and prev_spk != seg["speaker"]
+            ):
+                # Island detected — absorb into surrounding speaker
+                cleaned[-1]["end"] = max(cleaned[-1]["end"], seg["end"])
+            else:
+                cleaned.append(seg.copy())
+        cleaned.append(merged[-1].copy())
+    else:
+        cleaned = merged
+
+    # Pass 3: Absorb segments shorter than min_segment_duration into neighbors
+    result = []
+    for seg in cleaned:
+        duration = seg["end"] - seg["start"]
+        if duration >= min_segment_duration:
+            result.append(seg)
+        elif result:
+            # Absorb into previous segment (extend its end boundary)
+            result[-1]["end"] = max(result[-1]["end"], seg["end"])
+        # If no previous segment exists, drop silently (leading micro-segment)
+
+    if not result:
+        return cleaned  # Safety fallback
+
+    # Pass 4: Final same-speaker merge (catches segments made adjacent by passes 2-3)
+    final = [result[0].copy()]
+    for seg in result[1:]:
+        prev = final[-1]
+        if seg["speaker"] == prev["speaker"]:
+            prev["end"] = max(prev["end"], seg["end"])
+        else:
+            final.append(seg.copy())
+
+    return final
+
+
+# ---------------------------------------------------------------------------
+# Overlap Detection
+# ---------------------------------------------------------------------------
+
+
 def find_overlaps(
     segments: list[dict],
 ) -> tuple[list[dict], list[dict]]:
     """Split segments into non-overlapping and overlapping regions.
 
-    Returns (non_overlap_segments, overlap_regions).
+    Uses an event-based sweep-line algorithm to precisely identify regions
+    where multiple speakers are active simultaneously.
     """
     if not segments:
         return [], []
@@ -104,41 +220,29 @@ def find_overlaps(
     if len(speakers) < 2:
         return segments, []
 
-    # Build per-speaker timelines
-    from collections import defaultdict
-
-    speaker_intervals = defaultdict(list)
-    for seg in segments:
-        speaker_intervals[seg["speaker"]].append((seg["start"], seg["end"]))
-
-    # Find overlapping time regions across any two speakers
-    all_intervals = [(seg["start"], seg["end"]) for seg in segments]
-    all_intervals.sort()
-
     overlaps = []
     non_overlaps = []
 
-    # Use an event-based approach
     events = []
     for seg in segments:
         events.append((seg["start"], 1, seg["speaker"]))
         events.append((seg["end"], -1, seg["speaker"]))
     events.sort(key=lambda e: (e[0], e[1]))
 
-    active = {}
+    active: dict[str, int] = {}
     prev_time = 0.0
 
-    for time, delta, speaker in events:
-        if time > prev_time and active:
+    for time_val, delta, speaker in events:
+        if time_val > prev_time and active:
             active_speakers = [s for s, c in active.items() if c > 0]
-            region = {"start": prev_time, "end": time, "speakers": active_speakers}
+            region = {"start": prev_time, "end": time_val, "speakers": active_speakers}
             if len(active_speakers) > 1:
                 overlaps.append(region)
             elif len(active_speakers) == 1:
                 non_overlaps.append({
                     "speaker": active_speakers[0],
                     "start": prev_time,
-                    "end": time,
+                    "end": time_val,
                 })
 
         if delta == 1:
@@ -148,13 +252,13 @@ def find_overlaps(
             if active[speaker] <= 0:
                 del active[speaker]
 
-        prev_time = time
+        prev_time = time_val
 
     return non_overlaps, overlaps
 
 
 # ---------------------------------------------------------------------------
-# Stage 3: Speaker Embedding Extraction
+# Stage 4: Speaker Embedding Extraction (improved)
 # ---------------------------------------------------------------------------
 
 
@@ -163,10 +267,17 @@ def extract_speaker_embeddings(
     sr: int,
     segments: list[dict],
     embedder,
-    num_enrollment: int = 5,
-    min_duration: float = 1.0,
+    num_enrollment: int = 8,
+    min_duration: float = 0.5,
 ) -> dict:
-    """Extract centroid embedding for each speaker from their longest segments."""
+    """Extract duration-weighted centroid embedding for each speaker.
+
+    Improvements over simple averaging:
+    - Uses more enrollment segments (8 vs 5) for better representation
+    - Lower minimum duration threshold (0.5s vs 1.0s) to include more data
+    - Duration-weighted centroid: longer segments contribute more to the centroid,
+      producing more stable speaker representations
+    """
     import torch
 
     speakers = sorted(set(s["speaker"] for s in segments))
@@ -175,32 +286,35 @@ def extract_speaker_embeddings(
     for spk in speakers:
         spk_segs = [s for s in segments if s["speaker"] == spk]
         spk_segs.sort(key=lambda s: s["end"] - s["start"], reverse=True)
-        spk_segs = [s for s in spk_segs if (s["end"] - s["start"]) >= min_duration]
-        spk_segs = spk_segs[:num_enrollment]
+        eligible = [s for s in spk_segs if (s["end"] - s["start"]) >= min_duration]
 
-        if not spk_segs:
-            # Fall back to the longest segment regardless of duration
-            spk_segs = sorted(
-                [s for s in segments if s["speaker"] == spk],
-                key=lambda s: s["end"] - s["start"],
-                reverse=True,
-            )[:1]
+        if not eligible:
+            # Fall back to the longest segments available
+            eligible = spk_segs[:3]
+        else:
+            eligible = eligible[:num_enrollment]
 
         embeddings = []
-        for seg in spk_segs:
+        weights = []
+        for seg in eligible:
             start_sample = int(seg["start"] * sr)
             end_sample = int(seg["end"] * sr)
             chunk = audio[start_sample:end_sample]
 
-            if len(chunk) < sr * 0.1:  # < 100ms
+            if len(chunk) < sr * 0.1:
                 continue
 
             wav_tensor = torch.from_numpy(chunk).unsqueeze(0).float()
             emb = embedder.encode_batch(wav_tensor)
             embeddings.append(emb.squeeze().cpu())
+            weights.append(seg["end"] - seg["start"])
 
         if embeddings:
-            centroid = torch.stack(embeddings).mean(dim=0)
+            # Duration-weighted centroid (longer segments = more reliable)
+            weights_tensor = torch.tensor(weights, dtype=torch.float32)
+            weights_tensor = weights_tensor / weights_tensor.sum()
+            stacked = torch.stack(embeddings)
+            centroid = (stacked * weights_tensor.unsqueeze(1)).sum(dim=0)
             speaker_embeddings[spk] = centroid
         else:
             print(f"[WARN] No embeddings extracted for speaker {spk}")
@@ -209,7 +323,94 @@ def extract_speaker_embeddings(
 
 
 # ---------------------------------------------------------------------------
-# Stage 4: Hybrid Audio Separation
+# Stage 5: Speaker Assignment (improved)
+# ---------------------------------------------------------------------------
+
+
+def assign_speakers(
+    segments: list[dict],
+    speaker_embeddings: dict,
+    channel_a_audio: np.ndarray | None = None,
+    channel_b_audio: np.ndarray | None = None,
+    sr: int = 16000,
+) -> tuple[str, str]:
+    """Determine which diarization label maps to Speaker A vs Speaker B.
+
+    Primary: first speaker detected = Speaker A.
+    Validation: if channel audio is available, use channel-energy correlation
+    to verify and potentially correct the assignment.
+    """
+    speakers = sorted(speaker_embeddings.keys())
+    if len(speakers) < 2:
+        return speakers[0] if speakers else "SPEAKER_00", "SPEAKER_01"
+
+    # Primary: first speaker = Speaker A
+    first_speaker = None
+    min_start = float("inf")
+    for seg in segments:
+        if seg["start"] < min_start:
+            min_start = seg["start"]
+            first_speaker = seg["speaker"]
+
+    speaker_a_label = first_speaker
+    speaker_b_label = [s for s in speakers if s != speaker_a_label][0]
+
+    # Channel-energy validation: check if channel affinity is consistent
+    if channel_a_audio is not None and channel_b_audio is not None:
+        speaker_a_label, speaker_b_label = _validate_with_channel_energy(
+            segments, channel_a_audio, channel_b_audio, sr,
+            speaker_a_label, speaker_b_label,
+        )
+
+    return speaker_a_label, speaker_b_label
+
+
+def _validate_with_channel_energy(
+    segments: list[dict],
+    channel_a: np.ndarray,
+    channel_b: np.ndarray,
+    sr: int,
+    speaker_a_label: str,
+    speaker_b_label: str,
+) -> tuple[str, str]:
+    """Use per-segment channel energy to validate speaker-channel mapping.
+
+    If speaker_a consistently has more energy on channel_b (and vice versa),
+    the labels should be swapped. This corrects the common case where the
+    first-speaker heuristic assigns labels opposite to the actual mic placement.
+    """
+    ch_a_ratio = {speaker_a_label: [], speaker_b_label: []}
+
+    for seg in segments:
+        start = int(seg["start"] * sr)
+        end = int(seg["end"] * sr)
+        if end <= start or end > len(channel_a) or end > len(channel_b):
+            continue
+
+        e_a = np.sqrt(np.mean(channel_a[start:end] ** 2) + 1e-10)
+        e_b = np.sqrt(np.mean(channel_b[start:end] ** 2) + 1e-10)
+        ratio = e_a / (e_a + e_b + 1e-10)
+
+        spk = seg["speaker"]
+        if spk in ch_a_ratio:
+            ch_a_ratio[spk].append(ratio)
+
+    # Compute mean channel-A affinity for each speaker
+    a_mean = np.mean(ch_a_ratio[speaker_a_label]) if ch_a_ratio[speaker_a_label] else 0.5
+    b_mean = np.mean(ch_a_ratio[speaker_b_label]) if ch_a_ratio[speaker_b_label] else 0.5
+
+    # If Speaker A is consistently louder on channel B (ratio < 0.4) while
+    # Speaker B is louder on channel A (ratio > 0.6), swap the assignment
+    if a_mean < 0.4 and b_mean > 0.6:
+        print(f"  [Channel validation] Swapping labels: "
+              f"A_ch_a={a_mean:.2f}, B_ch_a={b_mean:.2f}")
+        return speaker_b_label, speaker_a_label
+
+    return speaker_a_label, speaker_b_label
+
+
+# ---------------------------------------------------------------------------
+# Stage 6a: Channel-Aware Audio Separation (Pipeline B)
 # ---------------------------------------------------------------------------
 
 
@@ -224,148 +425,220 @@ def cosine_fade(length: int, fade_in: bool = True) -> np.ndarray:
         return np.cos(t).astype(np.float32)
 
 
-def separate_overlap_chunk(
-    chunk: np.ndarray,
-    sr: int,
-    separator,
-    embedder,
-    speaker_embeddings: dict,
-    min_duration: float = 0.5,
-) -> dict:
-    """Run SepFormer on an overlap chunk and assign sources to speakers via embeddings."""
-    import torch
-
-    speakers = list(speaker_embeddings.keys())
-
-    # Pad short chunks
-    original_len = len(chunk)
-    if original_len < int(min_duration * sr):
-        pad_len = int(min_duration * sr) - original_len
-        chunk = np.concatenate([chunk, np.zeros(pad_len, dtype=np.float32)])
-
-    try:
-        wav_tensor = torch.from_numpy(chunk).unsqueeze(0).float().to(
-            next(separator.mods.parameters()).device
-        )
-        est_sources = separator.separate_batch(wav_tensor)
-        # est_sources shape: (batch, time, num_sources)
-        sources = est_sources.squeeze(0).cpu().numpy()
-
-        if sources.ndim == 1:
-            # Only one source returned — can't separate
-            return {spk: chunk[:original_len] / len(speakers) for spk in speakers}
-
-        num_sources = sources.shape[1] if sources.ndim == 2 else 1
-    except Exception as e:
-        print(f"[WARN] SepFormer failed on overlap chunk: {e}")
-        return {spk: chunk[:original_len] / len(speakers) for spk in speakers}
-
-    # Match sources to speakers via embedding cosine similarity
-    assignment = {}
-    used_sources = set()
-
-    for spk in speakers:
-        best_sim = -float("inf")
-        best_idx = 0
-
-        for src_idx in range(num_sources):
-            if src_idx in used_sources:
-                continue
-
-            source = sources[:, src_idx] if sources.ndim == 2 else sources
-            source_trimmed = source[:original_len]
-
-            if np.max(np.abs(source_trimmed)) < 1e-6:
-                continue
-
-            wav_tensor_src = torch.from_numpy(source_trimmed).unsqueeze(0).float()
-            try:
-                emb = embedder.encode_batch(wav_tensor_src).squeeze().cpu()
-                sim = torch.nn.functional.cosine_similarity(
-                    emb.unsqueeze(0),
-                    speaker_embeddings[spk].unsqueeze(0),
-                ).item()
-            except Exception:
-                sim = 0.0
-
-            if sim > best_sim:
-                best_sim = sim
-                best_idx = src_idx
-
-        used_sources.add(best_idx)
-        source = sources[:, best_idx] if sources.ndim == 2 else sources
-        assignment[spk] = source[:original_len]
-
-    return assignment
+def _apply_faded_chunk(
+    track: np.ndarray, start: int, end: int, chunk: np.ndarray, fade_samples: int
+):
+    """Apply a chunk with cosine fades into the track buffer using overlap-add."""
+    if len(chunk) == 0:
+        return
+    fi_len = min(fade_samples, len(chunk) // 2)
+    fo_len = min(fade_samples, len(chunk) // 2)
+    if fi_len > 0:
+        chunk[:fi_len] *= cosine_fade(fi_len, fade_in=True)
+    if fo_len > 0:
+        chunk[-fo_len:] *= cosine_fade(fo_len, fade_in=False)
+    actual_end = min(end, start + len(chunk), len(track))
+    actual_len = actual_end - start
+    if actual_len > 0:
+        track[start:actual_end] += chunk[:actual_len]
 
 
-def hybrid_separate(
-    audio: np.ndarray,
+def channel_aware_separate(
+    channel_a_audio: np.ndarray,
+    channel_b_audio: np.ndarray,
     sr: int,
     non_overlap_segments: list[dict],
     overlap_regions: list[dict],
-    separator,
-    embedder,
-    speaker_embeddings: dict,
-    fade_ms: int = 15,
+    speaker_a_label: str,
+    speaker_b_label: str,
+    fade_ms: int = 20,
 ) -> dict:
-    """Build per-speaker tracks using gating for non-overlaps, SepFormer for overlaps."""
-    speakers = sorted(speaker_embeddings.keys())
-    total_samples = len(audio)
+    """Build per-speaker tracks using the appropriate mic channel for each segment."""
+    total_samples = len(channel_a_audio)
     fade_samples = int(fade_ms * sr / 1000)
 
-    tracks = {spk: np.zeros(total_samples, dtype=np.float32) for spk in speakers}
+    track_a = np.zeros(total_samples, dtype=np.float32)
+    track_b = np.zeros(total_samples, dtype=np.float32)
 
-    # Non-overlapping segments: gate original audio
+    label_to_role = {speaker_a_label: "speaker_a", speaker_b_label: "speaker_b"}
+
     for seg in non_overlap_segments:
-        spk = seg["speaker"]
-        if spk not in tracks:
-            continue
-
         start = int(seg["start"] * sr)
         end = min(int(seg["end"] * sr), total_samples)
-        chunk = audio[start:end].copy()
+        if end <= start:
+            continue
+        role = label_to_role.get(seg["speaker"])
 
-        # Apply cosine fades
-        fi_len = min(fade_samples, len(chunk) // 2)
-        fo_len = min(fade_samples, len(chunk) // 2)
-        if fi_len > 0:
-            chunk[:fi_len] *= cosine_fade(fi_len, fade_in=True)
-        if fo_len > 0:
-            chunk[-fo_len:] *= cosine_fade(fo_len, fade_in=False)
+        if role == "speaker_a":
+            _apply_faded_chunk(track_a, start, end, channel_a_audio[start:end].copy(), fade_samples)
+        elif role == "speaker_b":
+            _apply_faded_chunk(track_b, start, end, channel_b_audio[start:end].copy(), fade_samples)
 
-        tracks[spk][start:end] += chunk
-
-    # Overlapping segments: SepFormer + embedding matching
     for region in overlap_regions:
         start = int(region["start"] * sr)
         end = min(int(region["end"] * sr), total_samples)
-        chunk = audio[start:end]
-
-        if len(chunk) < int(0.05 * sr):  # < 50ms — too short
+        if end - start < int(0.05 * sr):
             continue
+        _apply_faded_chunk(track_a, start, end, channel_a_audio[start:end].copy(), fade_samples)
+        _apply_faded_chunk(track_b, start, end, channel_b_audio[start:end].copy(), fade_samples)
 
-        assignment = separate_overlap_chunk(
-            chunk, sr, separator, embedder, speaker_embeddings
-        )
-
-        for spk in speakers:
-            if spk in assignment:
-                source = assignment[spk]
-                fi_len = min(fade_samples, len(source) // 2)
-                fo_len = min(fade_samples, len(source) // 2)
-                if fi_len > 0:
-                    source[:fi_len] *= cosine_fade(fi_len, fade_in=True)
-                if fo_len > 0:
-                    source[-fo_len:] *= cosine_fade(fo_len, fade_in=False)
-                seg_len = min(len(source), end - start)
-                tracks[spk][start : start + seg_len] += source[:seg_len]
-
-    return tracks
+    return {"speaker_a": track_a, "speaker_b": track_b}
 
 
 # ---------------------------------------------------------------------------
-# Stage 5: Stitching & Post-processing
+# Stage 6b: SepFormer-based Separation for Overlaps (Pipeline C)
+# ---------------------------------------------------------------------------
+
+
+def _separate_overlap_sepformer(
+    mixed_chunk: np.ndarray,
+    sr: int,
+    separator,
+    embedder,
+    speaker_embeddings: dict,
+    speaker_a_label: str,
+    speaker_b_label: str,
+    context_audio: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Run SepFormer on an overlap chunk and assign sources via embedding matching.
+
+    If context_audio is provided, it is prepended to the chunk for better
+    separation quality, then stripped from the output.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    min_samples = int(0.5 * sr)
+    original_len = len(mixed_chunk)
+
+    # Prepend context for better separation (SepFormer benefits from context)
+    context_len = 0
+    if context_audio is not None and len(context_audio) > 0:
+        mixed_chunk = np.concatenate([context_audio, mixed_chunk])
+        context_len = len(context_audio)
+
+    if len(mixed_chunk) < min_samples:
+        mixed_chunk = np.pad(mixed_chunk, (0, min_samples - len(mixed_chunk)))
+
+    wav_tensor = torch.from_numpy(mixed_chunk).unsqueeze(0).float()
+    sep_sources = separator.separate_batch(wav_tensor)
+
+    if sep_sources.dim() == 3:
+        src1 = sep_sources[0, :, 0].cpu().numpy()
+        src2 = sep_sources[0, :, 1].cpu().numpy()
+    else:
+        src1 = sep_sources[0].cpu().numpy()
+        src2 = sep_sources[1].cpu().numpy() if sep_sources.shape[0] > 1 else src1.copy()
+
+    # Strip context and padding
+    src1 = src1[context_len:context_len + original_len]
+    src2 = src2[context_len:context_len + original_len]
+
+    # Assign sources to speakers via embedding cosine similarity
+    a_emb = speaker_embeddings.get(speaker_a_label)
+    b_emb = speaker_embeddings.get(speaker_b_label)
+
+    if a_emb is None or b_emb is None:
+        return src1, src2
+
+    # Only compute embeddings if chunks are long enough
+    if len(src1) < sr * 0.1 or len(src2) < sr * 0.1:
+        return src1, src2
+
+    emb1 = embedder.encode_batch(torch.from_numpy(src1).unsqueeze(0).float()).squeeze().cpu()
+    emb2 = embedder.encode_batch(torch.from_numpy(src2).unsqueeze(0).float()).squeeze().cpu()
+
+    # Use both speaker embeddings for more robust permutation resolution
+    sim_1a = F.cosine_similarity(emb1.unsqueeze(0), a_emb.unsqueeze(0)).item()
+    sim_2a = F.cosine_similarity(emb2.unsqueeze(0), a_emb.unsqueeze(0)).item()
+    sim_1b = F.cosine_similarity(emb1.unsqueeze(0), b_emb.unsqueeze(0)).item()
+    sim_2b = F.cosine_similarity(emb2.unsqueeze(0), b_emb.unsqueeze(0)).item()
+
+    # Hungarian-style: pick assignment that maximizes total similarity
+    score_normal = sim_1a + sim_2b  # src1=A, src2=B
+    score_swapped = sim_2a + sim_1b  # src2=A, src1=B
+
+    if score_normal >= score_swapped:
+        return src1, src2
+    else:
+        return src2, src1
+
+
+def sepformer_separate(
+    channel_a_audio: np.ndarray,
+    channel_b_audio: np.ndarray,
+    mixed_audio: np.ndarray,
+    sr: int,
+    non_overlap_segments: list[dict],
+    overlap_regions: list[dict],
+    speaker_a_label: str,
+    speaker_b_label: str,
+    separator,
+    embedder,
+    speaker_embeddings: dict,
+    fade_ms: int = 20,
+    context_s: float = 0.25,
+) -> dict:
+    """Hybrid separation: channel-aware for non-overlaps, SepFormer for overlaps.
+
+    Improvements:
+    - Context padding around overlap chunks for better SepFormer quality
+    - Hungarian-style permutation resolution using both speaker embeddings
+    """
+    total_samples = len(channel_a_audio)
+    fade_samples = int(fade_ms * sr / 1000)
+    context_samples = int(context_s * sr)
+
+    track_a = np.zeros(total_samples, dtype=np.float32)
+    track_b = np.zeros(total_samples, dtype=np.float32)
+
+    label_to_role = {speaker_a_label: "speaker_a", speaker_b_label: "speaker_b"}
+
+    # Non-overlaps: extract from appropriate mic channel
+    for seg in non_overlap_segments:
+        start = int(seg["start"] * sr)
+        end = min(int(seg["end"] * sr), total_samples)
+        if end <= start:
+            continue
+        role = label_to_role.get(seg["speaker"])
+
+        if role == "speaker_a":
+            _apply_faded_chunk(track_a, start, end, channel_a_audio[start:end].copy(), fade_samples)
+        elif role == "speaker_b":
+            _apply_faded_chunk(track_b, start, end, channel_b_audio[start:end].copy(), fade_samples)
+
+    # Overlaps: run SepFormer with context + embedding matching
+    for region in overlap_regions:
+        start = int(region["start"] * sr)
+        end = min(int(region["end"] * sr), total_samples)
+        if end - start < int(0.05 * sr):
+            continue
+
+        mixed_chunk = mixed_audio[start:end]
+
+        # Extract context from before the overlap for better separation
+        ctx_start = max(0, start - context_samples)
+        context = mixed_audio[ctx_start:start] if ctx_start < start else None
+
+        try:
+            src_a, src_b = _separate_overlap_sepformer(
+                mixed_chunk, sr, separator, embedder,
+                speaker_embeddings, speaker_a_label, speaker_b_label,
+                context_audio=context,
+            )
+            _apply_faded_chunk(track_a, start, start + len(src_a), src_a.copy(), fade_samples)
+            _apply_faded_chunk(track_b, start, start + len(src_b), src_b.copy(), fade_samples)
+        except Exception as e:
+            print(f"[WARN] SepFormer failed on overlap at {region['start']:.1f}s: {e}")
+            # Fallback: use channel audio
+            _apply_faded_chunk(track_a, start, end, channel_a_audio[start:end].copy(), fade_samples)
+            _apply_faded_chunk(track_b, start, end, channel_b_audio[start:end].copy(), fade_samples)
+
+    return {"speaker_a": track_a, "speaker_b": track_b}
+
+
+# ---------------------------------------------------------------------------
+# Stage 7: Post-processing
 # ---------------------------------------------------------------------------
 
 
@@ -384,62 +657,98 @@ def postprocess_track(audio: np.ndarray, sr: int, peak_db: float = -1.0) -> byte
 
 
 # ---------------------------------------------------------------------------
-# Stage 6: Doctor vs Patient Assignment
+# Shared Stages: common preprocessing for both Pipeline B and C
 # ---------------------------------------------------------------------------
 
 
-def assign_roles(
-    tracks: dict,
-    segments: list[dict],
-    speaker_embeddings: dict,
-) -> tuple[str, str]:
-    """Determine which diarization speaker label maps to doctor vs patient.
+def _run_shared_stages(
+    channel_a_bytes: bytes,
+    channel_b_bytes: bytes,
+    mixed_bytes: bytes,
+    session_name: str,
+    diarizer,
+    embedder,
+    denoise_enabled: bool = True,
+    denoise_prop: float = 0.6,
+    num_speakers: int = 2,
+    num_enrollment: int = 8,
+    min_enrollment_duration: float = 0.5,
+    min_segment_duration: float = 0.25,
+    max_gap_merge: float = 0.3,
+    min_island_duration: float = 0.15,
+) -> dict:
+    """Run Stages 0-5 (preprocessing through speaker assignment), return state."""
+    print("[Stage 0] Loading audio channels...")
+    ch_a_audio, sr = load_and_preprocess(channel_a_bytes)
+    ch_b_audio, _ = load_and_preprocess(channel_b_bytes)
+    mixed_audio, _ = load_and_preprocess(mixed_bytes)
+    print(f"  Duration: {len(mixed_audio)/sr:.1f}s @ {sr} Hz")
 
-    Primary heuristic: first speaker = doctor.
-    Fallback: speaker with less total speaking time = doctor.
+    if denoise_enabled:
+        print("[Stage 1] Denoising mixed signal for diarization...")
+        mixed_clean = denoise_audio(mixed_audio, sr, denoise_prop)
+    else:
+        mixed_clean = mixed_audio
 
-    Returns (doctor_label, patient_label).
-    """
-    speakers = sorted(speaker_embeddings.keys())
-    if len(speakers) < 2:
-        return speakers[0] if speakers else "SPEAKER_00", "SPEAKER_01"
+    print("[Stage 2] Diarizing (finding who spoke when)...")
+    raw_segments = diarize(mixed_clean, sr, diarizer, num_speakers)
+    speakers_found = set(s["speaker"] for s in raw_segments)
+    print(f"  Found {len(speakers_found)} speakers, {len(raw_segments)} raw segments")
 
-    # Find who speaks first
-    first_speaker = None
-    min_start = float("inf")
-    for seg in segments:
-        if seg["start"] < min_start:
-            min_start = seg["start"]
-            first_speaker = seg["speaker"]
+    print("[Stage 3] Post-processing diarization segments...")
+    segments = postprocess_segments(
+        raw_segments, min_segment_duration, max_gap_merge, min_island_duration,
+    )
+    print(f"  Cleaned: {len(raw_segments)} → {len(segments)} segments "
+          f"(removed {len(raw_segments) - len(segments)} fragments)")
 
-    # Calculate total speaking time per speaker
-    speaking_time = {spk: 0.0 for spk in speakers}
-    for seg in segments:
-        speaking_time[seg["speaker"]] = (
-            speaking_time.get(seg["speaker"], 0.0) + seg["end"] - seg["start"]
-        )
+    non_overlaps, overlaps = find_overlaps(segments)
+    total_dur = len(mixed_audio) / sr
+    overlap_dur = sum(r["end"] - r["start"] for r in overlaps)
+    overlap_pct = (overlap_dur / total_dur * 100) if total_dur > 0 else 0
+    print(f"  Non-overlap: {len(non_overlaps)} segments")
+    print(f"  Overlap: {len(overlaps)} regions ({overlap_dur:.1f}s / {overlap_pct:.1f}%)")
 
-    doctor_label = first_speaker
-    patient_label = [s for s in speakers if s != doctor_label][0]
+    print("[Stage 4] Extracting speaker embeddings (duration-weighted)...")
+    speaker_embeddings = extract_speaker_embeddings(
+        mixed_clean, sr, non_overlaps, embedder, num_enrollment, min_enrollment_duration
+    )
+    print(f"  Embeddings: {list(speaker_embeddings.keys())}")
 
-    # Sanity check: if the "doctor" speaks 3x more than "patient", swap
-    # (patients typically have longer descriptions)
-    if doctor_label and patient_label:
-        doc_time = speaking_time.get(doctor_label, 0)
-        pat_time = speaking_time.get(patient_label, 0)
-        if doc_time > 3 * pat_time and pat_time > 0:
-            doctor_label, patient_label = patient_label, doctor_label
+    print("[Stage 5] Assigning speaker labels...")
+    speaker_a_label, speaker_b_label = assign_speakers(
+        segments, speaker_embeddings, ch_a_audio, ch_b_audio, sr,
+    )
+    print(f"  Speaker A = {speaker_a_label}, Speaker B = {speaker_b_label}")
 
-    return doctor_label, patient_label
+    return {
+        "ch_a_audio": ch_a_audio,
+        "ch_b_audio": ch_b_audio,
+        "mixed_audio": mixed_audio,
+        "mixed_clean": mixed_clean,
+        "sr": sr,
+        "segments": segments,
+        "raw_segments": raw_segments,
+        "non_overlaps": non_overlaps,
+        "overlaps": overlaps,
+        "speaker_embeddings": speaker_embeddings,
+        "speaker_a_label": speaker_a_label,
+        "speaker_b_label": speaker_b_label,
+        "overlap_pct": round(overlap_pct, 1),
+        "num_segments": len(segments),
+        "num_raw_segments": len(raw_segments),
+    }
 
 
 # ---------------------------------------------------------------------------
-# Full Pipeline Orchestrator
+# Pipeline B: ML Diarization + Channel-Aware Extraction
 # ---------------------------------------------------------------------------
 
 
 def run_pipeline(
-    audio_bytes: bytes,
+    channel_a_bytes: bytes,
+    channel_b_bytes: bytes,
+    mixed_bytes: bytes,
     session_name: str,
     diarizer,
     embedder,
@@ -447,85 +756,113 @@ def run_pipeline(
     denoise_enabled: bool = True,
     denoise_prop: float = 0.6,
     num_speakers: int = 2,
-    num_enrollment: int = 5,
-    min_enrollment_duration: float = 1.0,
-    fade_ms: int = 15,
+    num_enrollment: int = 8,
+    min_enrollment_duration: float = 0.5,
+    fade_ms: int = 20,
     peak_db: float = -1.0,
 ) -> dict:
-    """Execute the full speaker separation pipeline.
+    """Pipeline B: channel-aware speaker separation.
 
-    Returns dict: {"original": bytes, "doctor": bytes, "patient": bytes}
+    Returns: {"speaker_a": bytes, "speaker_b": bytes, "metadata": dict}
     """
     print(f"\n{'='*60}")
-    print(f"Processing: {session_name}")
+    print(f"[Pipeline B: Channel-Aware] {session_name}")
     print(f"{'='*60}")
 
-    # Stage 0
-    print("[Stage 0] Loading and preprocessing audio...")
-    audio, sr = load_and_preprocess(audio_bytes)
-    print(f"  Audio: {len(audio)/sr:.1f}s @ {sr} Hz, {len(audio)} samples")
-
-    # Keep original for output
-    original_bytes = postprocess_track(audio, sr, peak_db)
-
-    # Stage 1
-    if denoise_enabled:
-        print("[Stage 1] Denoising...")
-        audio_clean = denoise_audio(audio, sr, denoise_prop)
-    else:
-        print("[Stage 1] Denoising skipped (disabled)")
-        audio_clean = audio
-
-    # Stage 2
-    print("[Stage 2] Diarizing (finding who spoke when)...")
-    segments = diarize(audio_clean, sr, diarizer, num_speakers)
-    speakers_found = set(s["speaker"] for s in segments)
-    print(f"  Found {len(speakers_found)} speakers, {len(segments)} segments")
-
-    if len(speakers_found) < 2:
-        print("[WARN] Only one speaker found — output tracks will be identical")
-
-    # Identify overlaps
-    non_overlaps, overlaps = find_overlaps(segments)
-    total_dur = len(audio) / sr
-    overlap_dur = sum(r["end"] - r["start"] for r in overlaps)
-    print(f"  Non-overlap segments: {len(non_overlaps)}")
-    print(f"  Overlap regions: {len(overlaps)} ({overlap_dur:.1f}s / {overlap_dur/total_dur*100:.1f}%)")
-
-    # Stage 3
-    print("[Stage 3] Extracting speaker embeddings...")
-    speaker_embeddings = extract_speaker_embeddings(
-        audio_clean, sr, non_overlaps, embedder, num_enrollment, min_enrollment_duration
-    )
-    print(f"  Embeddings extracted for: {list(speaker_embeddings.keys())}")
-
-    # Stage 4
-    print("[Stage 4] Hybrid separation (gate + SepFormer)...")
-    tracks = hybrid_separate(
-        audio_clean, sr, non_overlaps, overlaps,
-        separator, embedder, speaker_embeddings, fade_ms,
+    t0 = time.time()
+    state = _run_shared_stages(
+        channel_a_bytes, channel_b_bytes, mixed_bytes, session_name,
+        diarizer, embedder, denoise_enabled, denoise_prop,
+        num_speakers, num_enrollment, min_enrollment_duration,
     )
 
-    # Stage 5
-    print("[Stage 5] Post-processing tracks...")
-    track_bytes = {}
-    for spk, track in tracks.items():
-        track_bytes[spk] = postprocess_track(track, sr, peak_db)
+    print("[Stage 6] Channel-aware separation...")
+    tracks = channel_aware_separate(
+        state["ch_a_audio"], state["ch_b_audio"], state["sr"],
+        state["non_overlaps"], state["overlaps"],
+        state["speaker_a_label"], state["speaker_b_label"],
+        fade_ms,
+    )
 
-    # Stage 6
-    print("[Stage 6] Assigning doctor vs patient roles...")
-    doctor_label, patient_label = assign_roles(tracks, segments, speaker_embeddings)
-    print(f"  Doctor = {doctor_label}, Patient = {patient_label}")
-
+    print("[Stage 7] Post-processing...")
+    elapsed = round(time.time() - t0, 1)
     result = {
-        "original": original_bytes,
-        "doctor": track_bytes.get(doctor_label, original_bytes),
-        "patient": track_bytes.get(patient_label, original_bytes),
+        "speaker_a": postprocess_track(tracks["speaker_a"], state["sr"], peak_db),
+        "speaker_b": postprocess_track(tracks["speaker_b"], state["sr"], peak_db),
+        "metadata": {
+            "elapsed_s": elapsed,
+            "segments": state["num_segments"],
+            "raw_segments": state["num_raw_segments"],
+            "overlap_pct": state["overlap_pct"],
+        },
     }
 
-    for key, wav in result.items():
-        dur = len(wav) / (sr * 2)  # approximate (16-bit mono)
-        print(f"  Output '{key}': {len(wav)/1024:.0f} KB")
+    for key in ["speaker_a", "speaker_b"]:
+        print(f"  Output '{key}': {len(result[key])/1024:.0f} KB")
+    print(f"[Pipeline B DONE] {elapsed}s\n")
+    return result
 
-    print(f"[DONE] {session_name} complete.\n")
+
+# ---------------------------------------------------------------------------
+# Pipeline C: ML Diarization + SepFormer on Overlaps
+# ---------------------------------------------------------------------------
+
+
+def run_pipeline_sepformer(
+    channel_a_bytes: bytes,
+    channel_b_bytes: bytes,
+    mixed_bytes: bytes,
+    session_name: str,
+    diarizer,
+    embedder,
+    separator,
+    denoise_enabled: bool = True,
+    denoise_prop: float = 0.6,
+    num_speakers: int = 2,
+    num_enrollment: int = 8,
+    min_enrollment_duration: float = 0.5,
+    fade_ms: int = 20,
+    peak_db: float = -1.0,
+    context_s: float = 0.25,
+) -> dict:
+    """Pipeline C: SepFormer-based separation for overlap regions.
+
+    Returns: {"speaker_a": bytes, "speaker_b": bytes, "metadata": dict}
+    """
+    print(f"\n{'='*60}")
+    print(f"[Pipeline C: SepFormer] {session_name}")
+    print(f"{'='*60}")
+
+    t0 = time.time()
+    state = _run_shared_stages(
+        channel_a_bytes, channel_b_bytes, mixed_bytes, session_name,
+        diarizer, embedder, denoise_enabled, denoise_prop,
+        num_speakers, num_enrollment, min_enrollment_duration,
+    )
+
+    print("[Stage 6] SepFormer separation on overlaps...")
+    tracks = sepformer_separate(
+        state["ch_a_audio"], state["ch_b_audio"], state["mixed_audio"], state["sr"],
+        state["non_overlaps"], state["overlaps"],
+        state["speaker_a_label"], state["speaker_b_label"],
+        separator, embedder, state["speaker_embeddings"],
+        fade_ms, context_s,
+    )
+
+    print("[Stage 7] Post-processing...")
+    elapsed = round(time.time() - t0, 1)
+    result = {
+        "speaker_a": postprocess_track(tracks["speaker_a"], state["sr"], peak_db),
+        "speaker_b": postprocess_track(tracks["speaker_b"], state["sr"], peak_db),
+        "metadata": {
+            "elapsed_s": elapsed,
+            "segments": state["num_segments"],
+            "raw_segments": state["num_raw_segments"],
+            "overlap_pct": state["overlap_pct"],
+        },
+    }
+
+    for key in ["speaker_a", "speaker_b"]:
+        print(f"  Output '{key}': {len(result[key])/1024:.0f} KB")
+    print(f"[Pipeline C DONE] {elapsed}s\n")
     return result

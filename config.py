@@ -15,27 +15,36 @@ AUDIO_NORM_PEAK_DB = -1.0  # Peak normalization target (dB)
 # --- Denoising ---
 DENOISE_ENABLED = True
 DENOISE_PROP_DECREASE = 0.6  # Conservative to avoid speech distortion
+DENOISE_N_FFT = 2048  # Better frequency resolution than default 1024
+DENOISE_FREQ_MASK_SMOOTH_HZ = 500  # Smoother frequency masking
+DENOISE_TIME_MASK_SMOOTH_MS = 50  # Smoother time masking
 
 # --- Diarization ---
 NUM_SPEAKERS = 2
 
+# --- Diarization Post-Processing ---
+MIN_SEGMENT_DURATION = 0.25  # Merge segments shorter than this (seconds)
+MAX_GAP_MERGE = 0.3  # Merge same-speaker segments with gaps under this (seconds)
+MIN_ISLAND_DURATION = 0.15  # Remove isolated segments shorter than this (seconds)
+
 # --- Speaker Embeddings ---
-NUM_ENROLLMENT_SEGMENTS = 5  # Top N longest non-overlap segments per speaker
-MIN_ENROLLMENT_DURATION = 1.0  # Minimum segment length (seconds) for enrollment
+NUM_ENROLLMENT_SEGMENTS = 8  # Top N longest non-overlap segments per speaker
+MIN_ENROLLMENT_DURATION = 0.5  # Minimum segment length (seconds) for enrollment
 
 # --- Separation ---
-FADE_DURATION_MS = 15  # Cosine fade at segment boundaries (milliseconds)
+FADE_DURATION_MS = 20  # Cosine fade at segment boundaries (milliseconds)
 MIN_SEPFORMER_DURATION = 0.5  # Min chunk length for SepFormer (seconds)
 SEPFORMER_PADDING = 0.5  # Zero-pad short chunks to this length (seconds)
+SEPFORMER_CONTEXT_S = 0.25  # Context padding around overlap chunks for SepFormer
 
 # --- File Transfer ---
 VOLUME_THRESHOLD_BYTES = 50 * 1024 * 1024  # 50 MB — switch to Volume transfer above this
 
-# --- Doctor/Patient Assignment ---
-# "first_speaker" — whoever speaks first is labeled doctor
-# "less_speaking" — speaker with less total time is doctor
+# --- Speaker Assignment ---
+# "first_speaker" — whoever speaks first is labeled Speaker A
+# "channel_energy" — use channel energy correlation to assign
 ASSIGNMENT_PRIMARY = "first_speaker"
-ASSIGNMENT_FALLBACK = "less_speaking"
+ASSIGNMENT_FALLBACK = "channel_energy"
 
 # --- Output ---
 OUTPUT_SAMPLE_RATE = 16000
