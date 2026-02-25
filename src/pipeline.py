@@ -865,30 +865,29 @@ def channel_aware_separate(
             )
             _apply_faded_chunk(track_b, start, end, cleaned, fade_samples)
 
-    # Overlaps: Wiener filtering with speaker profiles
+    # Overlaps: per-channel leakage suppression (avoids mixing channels
+    # which doubles cross-talk and creates echo artifacts)
     for region in overlap_regions:
         start = int(region["start"] * sr)
         end = min(int(region["end"] * sr), total_samples)
         if end - start < int(0.05 * sr):
             continue
 
-        ch_a_chunk = channel_a_audio[start:end].copy()
-        ch_b_chunk = channel_b_audio[start:end].copy()
+        # Speaker A: primary = ch_a, suppress Speaker B leakage
+        primary_a = channel_a_audio[start:end].copy()
+        secondary_a = channel_b_audio[start:end].copy()
+        cleaned_a = leakage_suppress_chunk(
+            primary_a, secondary_a, leak_b2a, leakage_alpha, leakage_floor, n_fft, hop_length
+        )
+        _apply_faded_chunk(track_a, start, end, cleaned_a, fade_samples)
 
-        if profile_a is not None and profile_b is not None:
-            try:
-                src_a, src_b = wiener_separate_overlap(
-                    ch_a_chunk, ch_b_chunk, profile_a, profile_b, n_fft, hop_length
-                )
-                _apply_faded_chunk(track_a, start, end, src_a, fade_samples)
-                _apply_faded_chunk(track_b, start, end, src_b, fade_samples)
-                continue
-            except Exception as e:
-                print(f"[WARN] Wiener separation failed at {region['start']:.1f}s: {e}")
-
-        # Fallback: raw channels
-        _apply_faded_chunk(track_a, start, end, ch_a_chunk, fade_samples)
-        _apply_faded_chunk(track_b, start, end, ch_b_chunk, fade_samples)
+        # Speaker B: primary = ch_b, suppress Speaker A leakage
+        primary_b = channel_b_audio[start:end].copy()
+        secondary_b = channel_a_audio[start:end].copy()
+        cleaned_b = leakage_suppress_chunk(
+            primary_b, secondary_b, leak_a2b, leakage_alpha, leakage_floor, n_fft, hop_length
+        )
+        _apply_faded_chunk(track_b, start, end, cleaned_b, fade_samples)
 
     return {"speaker_a": track_a, "speaker_b": track_b}
 
@@ -1037,8 +1036,17 @@ def sepformer_separate(
             _apply_faded_chunk(track_b, start, start + len(src_b), src_b.copy(), fade_samples)
         except Exception as e:
             print(f"[WARN] SepFormer failed on overlap at {region['start']:.1f}s: {e}")
-            _apply_faded_chunk(track_a, start, end, channel_a_audio[start:end].copy(), fade_samples)
-            _apply_faded_chunk(track_b, start, end, channel_b_audio[start:end].copy(), fade_samples)
+            # Fallback: leakage suppression from primary channels
+            cleaned_a = leakage_suppress_chunk(
+                channel_a_audio[start:end].copy(), channel_b_audio[start:end].copy(),
+                leak_b2a, leakage_alpha, leakage_floor, n_fft, hop_length
+            )
+            cleaned_b = leakage_suppress_chunk(
+                channel_b_audio[start:end].copy(), channel_a_audio[start:end].copy(),
+                leak_a2b, leakage_alpha, leakage_floor, n_fft, hop_length
+            )
+            _apply_faded_chunk(track_a, start, end, cleaned_a, fade_samples)
+            _apply_faded_chunk(track_b, start, end, cleaned_b, fade_samples)
 
     return {"speaker_a": track_a, "speaker_b": track_b}
 

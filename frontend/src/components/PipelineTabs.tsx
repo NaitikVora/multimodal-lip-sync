@@ -6,27 +6,17 @@ interface Props {
   onSelect: (id: string) => void;
 }
 
-const TAB_COLORS: Record<string, { active: string; inactive: string; dot: string }> = {
-  energy: {
-    active: "border-zinc-400 text-zinc-200",
-    inactive: "border-transparent text-zinc-500 hover:text-zinc-400",
-    dot: "bg-zinc-400",
-  },
-  channel: {
-    active: "border-blue-500 text-blue-400",
-    inactive: "border-transparent text-zinc-500 hover:text-zinc-400",
-    dot: "bg-blue-500",
-  },
-  sepformer: {
-    active: "border-purple-500 text-purple-400",
-    inactive: "border-transparent text-zinc-500 hover:text-zinc-400",
-    dot: "bg-purple-500",
-  },
+const PIPE_CFG: Record<string, { color: string; label: string }> = {
+  energy:    { color: "#71717a", label: "Energy" },
+  channel:   { color: "#60a5fa", label: "Channel" },
+  sepformer: { color: "#a78bfa", label: "SepFormer" },
+  nemo:      { color: "#fbbf24", label: "NeMo" },
+  diarizen:  { color: "#f87171", label: "DiariZen" },
 };
 
-const PIPELINE_ORDER = ["energy", "channel", "sepformer"];
+const ORDER = ["energy", "channel", "sepformer", "nemo", "diarizen"];
 
-function formatTime(s: number): string {
+function fmtTime(s: number): string {
   if (s < 1) return "<1s";
   const m = Math.floor(s / 60);
   const sec = Math.floor(s % 60);
@@ -34,52 +24,44 @@ function formatTime(s: number): string {
 }
 
 export default function PipelineTabs({ pipelines, activeId, onSelect }: Props) {
-  const orderedIds = PIPELINE_ORDER.filter((id) => id in pipelines);
+  const ids = ORDER.filter(id => id in pipelines);
   const active = pipelines[activeId];
+  const cfg = PIPE_CFG[activeId] ?? PIPE_CFG.energy;
 
   return (
     <div>
-      {/* Tab bar */}
-      <div className="flex border-b border-zinc-800">
-        {orderedIds.map((id) => {
-          const p = pipelines[id];
-          const colors = TAB_COLORS[id] ?? TAB_COLORS.energy;
+      {/* Tab row */}
+      <div className="flex overflow-x-auto" style={{ borderBottom: "1px solid var(--border-subtle)" }}>
+        {ids.map(id => {
+          const c = PIPE_CFG[id] ?? PIPE_CFG.energy;
           const isActive = id === activeId;
-
+          const p = pipelines[id];
           return (
             <button
               key={id}
               onClick={() => onSelect(id)}
-              className={`flex items-center gap-2 px-4 py-2.5 text-xs font-medium border-b-2 transition-colors cursor-pointer ${
-                isActive ? colors.active : colors.inactive
-              }`}
+              className="px-3 py-2 text-xs font-medium transition-colors whitespace-nowrap flex-shrink-0 flex items-center gap-1.5"
+              id={`pipeline-tab-${id}`}
+              style={{
+                color: isActive ? c.color : "#52525b",
+                borderBottom: isActive ? `2px solid ${c.color}` : "2px solid transparent",
+              }}
             >
-              <span className={`w-1.5 h-1.5 rounded-full ${colors.dot}`} />
-              {p.label}
+              {c.label}
+              {p.error && <span className="w-1.5 h-1.5 rounded-full" style={{ background: "#f87171" }} />}
             </button>
           );
         })}
       </div>
 
-      {/* Metadata row for active pipeline */}
+      {/* Stats row */}
       {active && (
-        <div className="flex items-center gap-4 px-4 py-2 text-[11px] text-zinc-500">
-          <span>
-            Time: <span className="text-zinc-400">{formatTime(active.elapsed_s)}</span>
-          </span>
-          {active.segments > 0 && (
-            <span>
-              Segments: <span className="text-zinc-400">{active.segments}</span>
-            </span>
-          )}
-          {active.segments > 0 && (
-            <span>
-              Overlap: <span className="text-zinc-400">{active.overlap_pct}%</span>
-            </span>
-          )}
-          {active.id === "energy" && (
-            <span className="text-zinc-600">No GPU required</span>
-          )}
+        <div className="px-4 py-2 flex items-center gap-4 text-[11px]" style={{ color: "#52525b" }}>
+          <span style={{ color: cfg.color }}>{cfg.label}</span>
+          {active.elapsed_s > 0 && <span>{fmtTime(active.elapsed_s)}</span>}
+          {active.segments > 0 && <span>{active.segments} segs</span>}
+          {active.overlap_pct > 0 && <span>{active.overlap_pct}% overlap</span>}
+          {active.error && <span style={{ color: "#f87171" }}>{active.error.slice(0, 60)}</span>}
         </div>
       )}
     </div>

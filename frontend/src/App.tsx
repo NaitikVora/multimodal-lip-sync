@@ -8,11 +8,13 @@ export default function App() {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [health, setHealth] = useState<"ok" | "error" | "loading">("loading");
   const [loading, setLoading] = useState(true);
+  const [showUpload, setShowUpload] = useState(false);
 
   const loadSessions = useCallback(async () => {
     try {
       const s = await fetchSessions();
       setSessions(s);
+      if (s.length === 0) setShowUpload(true);
     } catch {
       /* ignore */
     } finally {
@@ -23,92 +25,89 @@ export default function App() {
   useEffect(() => {
     loadSessions();
     fetchHealth()
-      .then((h) => setHealth(h.status === "ok" ? "ok" : "error"))
+      .then(h => setHealth(h.status === "ok" ? "ok" : "error"))
       .catch(() => setHealth("error"));
   }, [loadSessions]);
 
   return (
-    <div className="min-h-screen bg-zinc-950">
-      {/* Accent bar */}
-      <div className="h-0.5 bg-gradient-to-r from-blue-600 via-blue-500 to-emerald-500" />
-
+    <div className="min-h-screen" style={{ background: "var(--bg-base)" }}>
       {/* Header */}
-      <header className="border-b border-zinc-800/80">
-        <div className="max-w-5xl mx-auto px-6 py-5 flex items-center justify-between">
-          <div>
-            <h1 className="text-lg font-semibold text-zinc-100 tracking-tight">
-              Speaker Separation
+      <header
+        className="sticky top-0 z-50"
+        style={{
+          background: "rgba(9,9,11,0.9)",
+          backdropFilter: "blur(12px)",
+          borderBottom: "1px solid var(--border-subtle)",
+        }}
+      >
+        <div className="max-w-3xl mx-auto px-5 py-3.5 flex items-center justify-between">
+          <div className="flex items-center gap-2.5">
+            <h1 className="text-sm font-semibold tracking-tight" style={{ color: "#e4e4e7" }}>
+              SpeakerLens
             </h1>
-            <p className="text-xs text-zinc-500 mt-0.5">
-              Audio &rarr; separated Speaker A &amp; Speaker B tracks
-            </p>
-          </div>
-          <div className="flex items-center gap-2 text-xs text-zinc-500">
             <span
-              className={`w-2 h-2 rounded-full ${
-                health === "ok"
-                  ? "bg-emerald-500"
-                  : health === "error"
-                    ? "bg-red-500"
-                    : "bg-zinc-600 animate-pulse"
-              }`}
+              className="w-1.5 h-1.5 rounded-full flex-shrink-0"
+              style={{
+                background: health === "ok" ? "#34d399" : health === "error" ? "#f87171" : "#52525b",
+              }}
+              title={`Modal ${health}`}
             />
-            Modal{" "}
-            {health === "ok"
-              ? "connected"
-              : health === "error"
-                ? "unavailable"
-                : "checking\u2026"}
+          </div>
+
+          <div className="flex items-center gap-2">
+            {sessions.length > 0 && (
+              <button onClick={loadSessions} className="btn-ghost" id="refresh-sessions-btn">
+                <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                </svg>
+              </button>
+            )}
+            <button
+              onClick={() => setShowUpload(prev => !prev)}
+              className="btn-ghost"
+              id="toggle-upload-btn"
+            >
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+              </svg>
+              New
+            </button>
           </div>
         </div>
       </header>
 
       {/* Main */}
-      <main className="max-w-5xl mx-auto px-6 py-8">
-        <section className="mb-10">
-          <UploadZone onUploadComplete={loadSessions} />
-        </section>
+      <main className="max-w-3xl mx-auto px-5 py-6">
+        {showUpload && (
+          <section className="mb-6 animate-fade-in">
+            <UploadZone onUploadComplete={() => { loadSessions(); setShowUpload(false); }} />
+          </section>
+        )}
 
-        <section>
-          <h2 className="text-xs font-semibold text-zinc-500 uppercase tracking-widest mb-4">
-            Sessions ({sessions.length})
-          </h2>
-
-          {loading && (
-            <p className="text-sm text-zinc-600 py-12 text-center">
-              Loading sessions...
-            </p>
-          )}
-
-          {!loading && sessions.length === 0 && (
-            <div className="text-center py-16 text-zinc-600">
-              <div className="w-12 h-12 mx-auto mb-4 rounded-full bg-zinc-800/80 flex items-center justify-center">
-                <svg className="w-6 h-6 text-zinc-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m-4-4h8m-4-8a3 3 0 00-3-3v0a3 3 0 00-3 3v4a3 3 0 003 3h0a3 3 0 003-3V7z" />
-                </svg>
-              </div>
-              <p className="text-sm font-medium text-zinc-400 mb-1">No sessions found</p>
-              <p className="text-xs text-zinc-600">
-                Upload WAV files or add them to the Audio_Files/ directory
-              </p>
-            </div>
-          )}
-
-          <div className="space-y-4">
-            {sessions.map((s) => (
-              <SessionCard
-                key={s.num}
-                session={s}
-                onProcessingDone={loadSessions}
-              />
+        {loading && (
+          <div className="space-y-3">
+            {[1, 2].map(n => (
+              <div key={n} className="h-16 rounded-xl" style={{ background: "var(--bg-card)", border: "1px solid var(--border-subtle)" }} />
             ))}
           </div>
-        </section>
-      </main>
+        )}
 
-      <footer className="text-center text-[11px] text-zinc-700 py-8">
-        Powered by Modal GPU Cloud &middot; pyannote &middot; SpeechBrain SepFormer
-      </footer>
+        {!loading && sessions.length === 0 && !showUpload && (
+          <div className="text-center py-16 animate-fade-in">
+            <p className="text-sm mb-1" style={{ color: "#52525b" }}>No sessions yet</p>
+            <p className="text-xs mb-4" style={{ color: "#3f3f46" }}>Upload WAV recordings to get started</p>
+            <button onClick={() => setShowUpload(true)} className="btn-primary" id="get-started-btn">
+              Upload Audio
+            </button>
+          </div>
+        )}
+
+        <div className="space-y-3">
+          {sessions.map(s => (
+            <SessionCard key={s.num} session={s} onProcessingDone={loadSessions} />
+          ))}
+        </div>
+      </main>
     </div>
   );
 }

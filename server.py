@@ -2,6 +2,21 @@
 
 Run with:  python server.py
            or: uvicorn server:app --reload --port 8000
+
+Pipelines:
+  - energy:    Local energy-based (instantaneous, no GPU)
+  - channel:   pyannote 3.1 + Channel-Aware Wiener (Modal GPU)
+  - sepformer: pyannote 3.1 + SepFormer neural separation (Modal GPU)
+  - nemo:      NVIDIA NeMo MSDD + TitaNet (Modal GPU)
+  - diarizen:  DiariZen (VoxSRC 2023 winner) + CAM++ (Modal GPU)
+
+Endpoints:
+  POST /api/process/{session_num}           — launch all 5 pipelines
+  GET  /api/process/{job_id}/status         — SSE job progress stream
+  GET  /api/results/{session_num}           — pipeline comparison results
+  GET  /api/results/{session_num}/{pipe}/{track} — serve audio file
+  POST /api/transcribe/{session_num}        — Whisper transcription (SSE)
+  GET  /api/transcript/{session_num}        — get stored transcript
 """
 
 import asyncio
@@ -30,14 +45,25 @@ OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 TRACKS = ["speaker_a", "speaker_b"]
-PIPELINES = ["energy", "channel", "sepformer"]
+
+# All pipelines: energy runs locally, the rest on Modal GPU
+PIPELINES = ["energy", "channel", "sepformer", "nemo", "diarizen"]
 PIPELINE_LABELS = {
-    "energy": "Energy-Based",
-    "channel": "ML + Channel-Aware",
-    "sepformer": "ML + SepFormer",
+    "energy":    "Energy-Based",
+    "channel":   "Pyannote + Channel Wiener",
+    "sepformer": "Pyannote + SepFormer",
+    "nemo":      "NVIDIA NeMo MSDD",
+    "diarizen":  "DiariZen (VoxSRC)",
+}
+PIPELINE_DESCRIPTIONS = {
+    "energy":    "Fast heuristic, no GPU. Channel energy assignment.",
+    "channel":   "Pyannote 3.1 diarization + leakage suppression + Wiener overlap separation.",
+    "sepformer": "Pyannote 3.1 + SpeechBrain SepFormer neural source separation for overlaps.",
+    "nemo":      "NVIDIA NeMo MSDD multi-scale diarizer + TitaNet speaker embeddings.",
+    "diarizen":  "DiariZen (VoxSRC 2023 winner) end-to-end + CAM++ speaker embeddings.",
 }
 
-app = FastAPI(title="Speaker Separation", version="4.0.0")
+app = FastAPI(title="Speaker Separation", version="5.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -47,10 +73,11 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
-# In-memory job store
+# In-memory job & transcript store
 # ---------------------------------------------------------------------------
 
 jobs: dict[str, dict] = {}
+transcripts: dict[str, dict] = {}    # session_name -> transcript data
 
 
 def _get_pipeline():
@@ -71,6 +98,10 @@ def _session_has_results(session_name: str) -> bool:
     return False
 
 
+def _transcript_path(session_name: str) -> Path:
+    return OUTPUT_DIR / session_name / "transcript.json"
+
+
 # ---------------------------------------------------------------------------
 # API: Health
 # ---------------------------------------------------------------------------
@@ -80,7 +111,7 @@ def _session_has_results(session_name: str) -> bool:
 async def health_check():
     try:
         modal.Cls.from_name(MODAL_APP_NAME, "SpeakerSeparationPipeline")
-        return {"status": "ok", "detail": "Modal app deployed and reachable"}
+        return {"status": "ok", "detail": "Modal app deployed and reachable", "pipelines": PIPELINES}
     except Exception as e:
         return {"status": "error", "detail": str(e)}
 
@@ -113,9 +144,9 @@ async def list_sessions():
                 unique.append(f)
 
         total_bytes = sum(f.stat().st_size for f in unique)
-
         session_name = f"session_{num:03d}"
         has_results = _session_has_results(session_name)
+        has_transcript = _transcript_path(session_name).exists()
 
         active_job = None
         for jid, j in jobs.items():
@@ -131,6 +162,7 @@ async def list_sessions():
             "total_bytes": total_bytes,
             "total_mb": round(total_bytes / (1024 * 1024), 1),
             "has_results": has_results,
+            "has_transcript": has_transcript,
             "active_job": active_job,
         })
 
@@ -161,7 +193,7 @@ async def upload_files(
 
 
 # ---------------------------------------------------------------------------
-# API: Process (runs all 3 pipelines)
+# API: Process (runs all 5 pipelines)
 # ---------------------------------------------------------------------------
 
 
@@ -170,7 +202,7 @@ def _save_pipeline_results(session_name: str, pipeline_id: str, results: dict):
     out_dir = _session_output_dir(session_name, pipeline_id)
     out_dir.mkdir(parents=True, exist_ok=True)
     for track in TRACKS:
-        if track in results:
+        if track in results and results[track]:
             save_wav_bytes(results[track], out_dir / f"{track}.wav")
 
 
@@ -210,48 +242,78 @@ async def _run_processing(job_id: str, session_num: int):
         energy_elapsed = round(time.time() - t0, 1)
         _save_pipeline_results(session_name, "energy", energy_results)
         job["stage"] = "energy_done"
+        job["pipeline_metadata"] = {
+            "energy": {
+                "elapsed_s": energy_elapsed,
+                "segments": 0,
+                "overlap_pct": 0,
+                "model": "energy",
+            }
+        }
 
-        # --- Pipelines B + C: ML-based (Modal GPU) ---
+        # --- Pipelines B, C, D, E: ML-based (Modal GPU) ---
         job["stage"] = "gpu_processing"
         pipeline = _get_pipeline()
 
+        # Use process_all_pipelines if deployed; fall back to process_session_compare
+        # for older deployments that don't have NeMo/DiariZen yet.
+        def _call_gpu(pipe, ch_a, ch_b, mixed, sname):
+            try:
+                return pipe.process_all_pipelines.remote(ch_a, ch_b, mixed, sname)
+            except Exception as e:
+                if "process_all_pipelines" in str(e) or "has no method" in str(e).lower():
+                    print(f"[WARN] process_all_pipelines not found on deployed Modal class, "
+                          f"falling back to process_session_compare: {e}")
+                    old = pipe.process_session_compare.remote(ch_a, ch_b, mixed, sname)
+                    return old  # returns {"channel": ..., "sepformer": ...}
+                raise
+
         gpu_results = await loop.run_in_executor(
             None,
-            pipeline.process_session_compare.remote,
+            _call_gpu,
+            pipeline,
             channels["channel_a_bytes"],
             channels["channel_b_bytes"],
             channels["mixed_bytes"],
             session_name,
         )
 
-        # Save Pipeline B (channel-aware)
-        _save_pipeline_results(session_name, "channel", gpu_results["channel"])
-        channel_meta = gpu_results["channel"].get("metadata", {})
+        # Save each ML pipeline result
+        pipeline_meta = {"energy": job["pipeline_metadata"]["energy"]}
 
-        # Save Pipeline C (sepformer)
-        _save_pipeline_results(session_name, "sepformer", gpu_results["sepformer"])
-        sepformer_meta = gpu_results["sepformer"].get("metadata", {})
+        for pid in ["channel", "sepformer", "nemo", "diarizen"]:
+            if pid in gpu_results:
+                result = gpu_results[pid]
+                _save_pipeline_results(session_name, pid, result)
+                meta = result.get("metadata", {})
+                pipeline_meta[pid] = {
+                    "elapsed_s": meta.get("elapsed_s", 0),
+                    "segments": meta.get("segments", 0),
+                    "overlap_pct": meta.get("overlap_pct", 0),
+                    "model": meta.get("model", pid),
+                    "error": meta.get("error"),
+                }
 
+        job["pipeline_metadata"] = pipeline_meta
         job["stage"] = "saving"
 
-        # Store per-pipeline metadata in the job
-        job["pipeline_metadata"] = {
-            "energy": {
-                "elapsed_s": energy_elapsed,
-                "segments": 0,
-                "overlap_pct": 0,
-            },
-            "channel": {
-                "elapsed_s": channel_meta.get("elapsed_s", 0),
-                "segments": channel_meta.get("segments", 0),
-                "overlap_pct": channel_meta.get("overlap_pct", 0),
-            },
-            "sepformer": {
-                "elapsed_s": sepformer_meta.get("elapsed_s", 0),
-                "segments": sepformer_meta.get("segments", 0),
-                "overlap_pct": sepformer_meta.get("overlap_pct", 0),
-            },
-        }
+        # --- Auto-transcribe with the best pipeline's diarization ---
+        job["stage"] = "transcribing"
+        try:
+            transcript_result = await loop.run_in_executor(
+                None,
+                pipeline.transcribe_session.remote,
+                channels["channel_a_bytes"],
+                channels["channel_b_bytes"],
+                channels["mixed_bytes"],
+                session_name,
+                None,  # language = auto
+            )
+            _transcript_path(session_name).parent.mkdir(parents=True, exist_ok=True)
+            _transcript_path(session_name).write_text(json.dumps(transcript_result))
+            transcripts[session_name] = transcript_result
+        except Exception as te:
+            print(f"[WARN] Transcription failed: {te}")
 
         job["status"] = "done"
         job["stage"] = "complete"
@@ -268,7 +330,12 @@ async def _run_processing(job_id: str, session_num: int):
 
 
 @app.post("/api/process/{session_num}")
-async def start_processing(session_num: int):
+async def start_processing(session_num: int, force: bool = False):
+    """Launch all pipelines for a session.
+
+    ?force=true  — re-run even if results already exist (reprocess / redeploy results).
+    """
+    # Block duplicate jobs unless forced
     for jid, j in jobs.items():
         if j["session_num"] == session_num and j["status"] in ("pending", "processing"):
             return {"job_id": jid, "status": j["status"], "message": "Already processing"}
@@ -280,10 +347,12 @@ async def start_processing(session_num: int):
         "status": "pending",
         "stage": "queued",
         "created_at": time.time(),
+        "pipeline_metadata": {},
+        "forced": force,
     }
 
     asyncio.create_task(_run_processing(job_id, session_num))
-    return {"job_id": job_id, "status": "pending"}
+    return {"job_id": job_id, "status": "pending", "forced": force}
 
 
 @app.get("/api/process/{job_id}/status")
@@ -335,8 +404,7 @@ async def get_results(session_num: int):
                 }
 
         if tracks:
-            # Try to find metadata from the most recent job
-            meta = {"elapsed_s": 0, "segments": 0, "overlap_pct": 0}
+            meta = {"elapsed_s": 0, "segments": 0, "overlap_pct": 0, "model": pid}
             for j in jobs.values():
                 if j.get("session_num") == session_num and j.get("pipeline_metadata"):
                     pm = j["pipeline_metadata"].get(pid)
@@ -346,11 +414,14 @@ async def get_results(session_num: int):
 
             pipelines[pid] = {
                 "id": pid,
-                "label": PIPELINE_LABELS[pid],
+                "label": PIPELINE_LABELS.get(pid, pid),
+                "description": PIPELINE_DESCRIPTIONS.get(pid, ""),
                 "tracks": tracks,
                 "elapsed_s": meta.get("elapsed_s", 0),
                 "segments": meta.get("segments", 0),
                 "overlap_pct": meta.get("overlap_pct", 0),
+                "model": meta.get("model", pid),
+                "error": meta.get("error"),
             }
 
     if not pipelines:
@@ -373,6 +444,93 @@ async def serve_track(session_num: int, pipeline: str, track: str):
         raise HTTPException(status_code=404, detail="File not found")
 
     return FileResponse(path, media_type="audio/wav", filename=f"{session_name}_{pipeline}_{track}.wav")
+
+
+# ---------------------------------------------------------------------------
+# API: Transcription
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/transcribe/{session_num}")
+async def start_transcription(session_num: int):
+    """Trigger Whisper transcription for a session (already processed)."""
+    session_name = f"session_{session_num:03d}"
+    folder = find_session_folder(AUDIO_DIR, session_num)
+    if folder is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # Check if transcript already exists
+    tp = _transcript_path(session_name)
+    if tp.exists():
+        data = json.loads(tp.read_text())
+        return {"status": "cached", "session_num": session_num, "transcript": data}
+
+    # Run transcription async
+    job_id = f"transcript_{session_num}"
+
+    async def _do_transcribe():
+        loop = asyncio.get_event_loop()
+        try:
+            channels, _ = await loop.run_in_executor(
+                None, load_session_audio_separate, folder
+            )
+            pipeline = _get_pipeline()
+            result = await loop.run_in_executor(
+                None,
+                pipeline.transcribe_session.remote,
+                channels["channel_a_bytes"],
+                channels["channel_b_bytes"],
+                channels["mixed_bytes"],
+                session_name,
+                None,
+            )
+            tp.parent.mkdir(parents=True, exist_ok=True)
+            tp.write_text(json.dumps(result))
+            transcripts[session_name] = result
+        except Exception as e:
+            transcripts[session_name] = {"error": str(e)}
+
+    asyncio.create_task(_do_transcribe())
+    return {"status": "processing", "session_num": session_num}
+
+
+@app.get("/api/transcript/{session_num}")
+async def get_transcript(session_num: int):
+    """Get stored transcript for a session."""
+    session_name = f"session_{session_num:03d}"
+
+    # Check in-memory cache first
+    if session_name in transcripts:
+        return {"session_num": session_num, **transcripts[session_name]}
+
+    # Check disk
+    tp = _transcript_path(session_name)
+    if tp.exists():
+        data = json.loads(tp.read_text())
+        transcripts[session_name] = data
+        return {"session_num": session_num, **data}
+
+    raise HTTPException(status_code=404, detail="No transcript found")
+
+
+# ---------------------------------------------------------------------------
+# API: Pipeline metadata / comparison
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/pipelines")
+async def list_pipelines():
+    """Return metadata about all available pipelines."""
+    return {
+        "pipelines": [
+            {
+                "id": pid,
+                "label": PIPELINE_LABELS[pid],
+                "description": PIPELINE_DESCRIPTIONS[pid],
+            }
+            for pid in PIPELINES
+        ]
+    }
 
 
 # ---------------------------------------------------------------------------
